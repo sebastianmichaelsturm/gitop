@@ -32,7 +32,7 @@ fn render_fleet_overview(f: &mut Frame, app: &mut App, area: Rect) {
     // Header
     let dirty_count = app.repos.iter().filter(|r| r.is_dirty).count();
     let header_text = vec![
-        Span::styled(" gittop ", Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::styled(" gitop ", Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)),
         Span::raw("  "),
         Span::styled(format!("Total Repos: {} ", app.repos.len()), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
         Span::raw("│ "),

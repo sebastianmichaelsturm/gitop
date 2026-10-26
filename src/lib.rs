@@ -23,7 +23,7 @@ use watcher::RepoWatcher;
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "gittop",
+    name = "gitop",
     about = "A real-time top-like terminal dashboard for git repositories with branch graph and commit inspector",
     version = "0.1.0"
 )]

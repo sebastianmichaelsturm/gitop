@@ -421,7 +421,7 @@ mod tests {
 
     #[test]
     fn test_discover_repos_pruning() {
-        let temp_dir = std::env::temp_dir().join("gittop_test_discover");
+        let temp_dir = std::env::temp_dir().join("gitop_test_discover");
         let _ = fs::remove_dir_all(&temp_dir);
 
         let repo1 = temp_dir.join("project_a");

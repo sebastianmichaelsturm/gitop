@@ -395,7 +395,7 @@ pub fn load_commit_details(
             "show",
             "--name-status",
             "--color=never",
-            "--format=format:INFO%x09%H%x09%an%x09%ad%x09%B---SPLIT_FILES---",
+            "--format=format:INFO%x09%H%x09%an <%ae>%x09%ad%x09%B---SPLIT_FILES---",
             commit_hash,
         ])
         .output()?;

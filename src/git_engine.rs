@@ -4,15 +4,17 @@ use git2::{BranchType, Repository, StatusOptions};
 use rayon::prelude::*;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::mpsc::Sender;
 use walkdir::WalkDir;
 
-const IGNORED_DIRS: &[&str] = &[
+pub const IGNORED_DIRS: &[&str] = &[
+    // Build and package caches
     "target",
     "node_modules",
     ".cargo",
     "AppData",
-    ".gemini",
     ".cache",
+    ".gemini",
     ".idea",
     ".vscode",
     "__pycache__",
@@ -21,13 +23,56 @@ const IGNORED_DIRS: &[&str] = &[
     "build",
     "tmp",
     "temp",
+    // Toolchains & Package managers
+    ".rustup",
+    ".nuget",
+    ".gradle",
+    ".m2",
+    "scoop",
+    ".local",
+    ".docker",
+    ".virtualenvs",
+    ".conda",
+    "venv",
+    ".venv",
+    "env",
+    // Cloud sync clients (prevent cloud hydration / network stalls)
+    "OneDrive",
+    "OneDrive - CONENGA Group GmbH",
+    "SynologyDrive",
+    "Dropbox",
+    "Google Drive",
+    // Virtualization
+    "VirtualBox VMs",
+    ".VirtualBox",
+    // Windows compatibility junctions & special folders
+    "Anwendungsdaten",
+    "Lokale Einstellungen",
+    "Cookies",
+    "Recent",
+    "SendTo",
+    "Startmenü",
+    "Vorlagen",
+    "Druckumgebung",
+    "Netzwerkumgebung",
+    "Eigene Dateien",
 ];
 
-/// Recursively scans for git repositories starting from `root`.
-/// Prunes recursion when a `.git` directory is encountered.
-pub fn discover_repos(root: &Path) -> Vec<PathBuf> {
+#[derive(Debug, Clone)]
+pub enum ScannerMessage {
+    Batch(Vec<RepoRecord>),
+    Finished(usize),
+}
+
+/// Recursively scans for git repositories starting from `root` with `max_depth`.
+/// Prunes recursion when a `.git` directory or ignored directory is encountered.
+pub fn discover_repos(root: &Path, max_depth: usize) -> Vec<PathBuf> {
     let mut repos = Vec::new();
-    let mut it = WalkDir::new(root).follow_links(false).into_iter();
+    let mut builder = WalkDir::new(root).follow_links(false);
+    if max_depth > 0 {
+        builder = builder.max_depth(max_depth);
+    }
+    let mut it = builder.into_iter();
 
     while let Some(entry) = it.next() {
         let entry = match entry {
@@ -39,7 +84,7 @@ pub fn discover_repos(root: &Path) -> Vec<PathBuf> {
         if file_type.is_dir() {
             let file_name = entry.file_name().to_string_lossy();
 
-            // Skip known huge/noise non-repo directories
+            // Skip known huge / noise / junction directories
             if IGNORED_DIRS.contains(&file_name.as_ref()) {
                 it.skip_current_dir();
                 continue;
@@ -68,6 +113,72 @@ pub fn discover_repos(root: &Path) -> Vec<PathBuf> {
     repos.sort();
     repos.dedup();
     repos
+}
+
+/// Runs repository discovery and inspection in the background, streaming batches of records.
+pub fn start_background_scan(root: PathBuf, max_depth: usize, tx: Sender<ScannerMessage>) {
+    std::thread::spawn(move || {
+        let mut builder = WalkDir::new(&root).follow_links(false);
+        if max_depth > 0 {
+            builder = builder.max_depth(max_depth);
+        }
+        let mut it = builder.into_iter();
+
+        let mut discovered_batch = Vec::new();
+        let mut total_found = 0;
+
+        while let Some(entry) = it.next() {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+
+            let file_type = entry.file_type();
+            if file_type.is_dir() {
+                let file_name = entry.file_name().to_string_lossy();
+
+                if IGNORED_DIRS.contains(&file_name.as_ref()) {
+                    it.skip_current_dir();
+                    continue;
+                }
+
+                if file_name == ".git" {
+                    if let Some(parent) = entry.path().parent() {
+                        discovered_batch.push(parent.to_path_buf());
+                    }
+                    it.skip_current_dir();
+                } else if entry.path().join(".git").exists() {
+                    discovered_batch.push(entry.path().to_path_buf());
+                    it.skip_current_dir();
+                }
+
+                // When batch reaches 5 or more, inspect and stream immediately
+                if discovered_batch.len() >= 5 {
+                    let records: Vec<RepoRecord> = discovered_batch
+                        .par_iter()
+                        .filter_map(|p| inspect_repo_in_memory(p, &root))
+                        .collect();
+                    total_found += records.len();
+                    if tx.send(ScannerMessage::Batch(records)).is_err() {
+                        return; // receiver dropped, exit thread
+                    }
+                    discovered_batch.clear();
+                }
+            }
+        }
+
+        // Flush remaining discovered repos
+        if !discovered_batch.is_empty() {
+            let records: Vec<RepoRecord> = discovered_batch
+                .par_iter()
+                .filter_map(|p| inspect_repo_in_memory(p, &root))
+                .collect();
+            total_found += records.len();
+            let _ = tx.send(ScannerMessage::Batch(records));
+        }
+
+        let _ = tx.send(ScannerMessage::Finished(total_found));
+    });
 }
 
 /// Inspects a single repository in-memory using git2
@@ -184,14 +295,18 @@ pub fn scan_all_repos_parallel(repos: &[PathBuf], root: &Path) -> Vec<RepoRecord
         .filter_map(|p| inspect_repo_in_memory(p, root))
         .collect();
 
+    sort_repo_records(&mut records);
+
+    records
+}
+
+pub fn sort_repo_records(records: &mut [RepoRecord]) {
     records.sort_by(|a, b| match (&a.last_commit_time, &b.last_commit_time) {
         (Some(ta), Some(tb)) => tb.cmp(ta),
         (Some(_), None) => std::cmp::Ordering::Less,
         (None, Some(_)) => std::cmp::Ordering::Greater,
         (None, None) => a.name.cmp(&b.name),
     });
-
-    records
 }
 
 /// Loads git log with full branch graph via `git log --graph --all`
@@ -426,24 +541,46 @@ mod tests {
 
         let repo1 = temp_dir.join("project_a");
         let repo1_git = repo1.join(".git");
-        let _repo1_sub = repo1.join("src").join(".git"); // fake sub .git, should be ignored
+        let _repo1_sub = repo1.join("src").join(".git");
 
         let repo2 = temp_dir.join("group").join("project_b");
         let repo2_git = repo2.join(".git");
 
         let ignored_target = temp_dir.join("project_c").join("target").join(".git");
+        let ignored_rustup = temp_dir.join(".rustup").join("toolchains").join(".git");
 
         fs::create_dir_all(&repo1_git).unwrap();
         fs::create_dir_all(repo1.join("src")).unwrap();
         fs::create_dir_all(&repo2_git).unwrap();
         fs::create_dir_all(&ignored_target).unwrap();
+        fs::create_dir_all(&ignored_rustup).unwrap();
 
-        let repos = discover_repos(&temp_dir);
+        let repos = discover_repos(&temp_dir, 5);
 
         assert!(repos.contains(&repo1));
         assert!(repos.contains(&repo2));
         assert!(!repos.contains(&repo1.join("src")));
         assert!(!repos.contains(&temp_dir.join("project_c")));
+        assert!(!repos.contains(&temp_dir.join(".rustup")));
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_discover_repos_depth_limit() {
+        let temp_dir = std::env::temp_dir().join("gitop_test_depth");
+        let _ = fs::remove_dir_all(&temp_dir);
+
+        let shallow_repo = temp_dir.join("shallow");
+        let deep_repo = temp_dir.join("d1").join("d2").join("d3").join("d4").join("d5").join("d6");
+
+        fs::create_dir_all(shallow_repo.join(".git")).unwrap();
+        fs::create_dir_all(deep_repo.join(".git")).unwrap();
+
+        // Max depth 3 should only find shallow
+        let repos = discover_repos(&temp_dir, 3);
+        assert!(repos.contains(&shallow_repo));
+        assert!(!repos.contains(&deep_repo));
 
         let _ = fs::remove_dir_all(&temp_dir);
     }
@@ -477,12 +614,7 @@ mod tests {
         r3.last_commit_time = None;
 
         let mut records = vec![r1, r3, r2];
-        records.sort_by(|a, b| match (&a.last_commit_time, &b.last_commit_time) {
-            (Some(ta), Some(tb)) => tb.cmp(ta),
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => a.name.cmp(&b.name),
-        });
+        sort_repo_records(&mut records);
 
         assert_eq!(records[0].name, "newest");
         assert_eq!(records[1].name, "old");

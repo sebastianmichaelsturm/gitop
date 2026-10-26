@@ -1,20 +1,27 @@
-use crate::git_engine;
+use crate::git_engine::{self, ScannerMessage};
 use crate::model::{ActiveView, CommitDetail, CommitGraphRow, DiffViewerState, RepoRecord};
 use ratatui::widgets::TableState;
 use std::path::PathBuf;
+use std::sync::mpsc::Receiver;
 
 pub struct App {
     pub root_path: PathBuf,
     pub max_commits: usize,
+    pub max_depth: usize,
     pub active_view: ActiveView,
 
     // Fleet Overview
-    pub discovered_paths: Vec<PathBuf>,
     pub repos: Vec<RepoRecord>,
     pub selected_repo_v_idx: usize,
     pub filter_query: String,
     pub is_filtering: bool,
     pub fleet_table_state: TableState,
+
+    // Background Scanning State
+    pub is_scanning: bool,
+    pub scan_spinner_frame: usize,
+    pub scanner_rx: Option<Receiver<ScannerMessage>>,
+    pub total_scanned: usize,
 
     // Repo Detail
     pub current_repo_path: Option<PathBuf>,
@@ -32,26 +39,26 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(root_path: PathBuf, max_commits: usize) -> Self {
-        let discovered = git_engine::discover_repos(&root_path);
-        let repos = git_engine::scan_all_repos_parallel(&discovered, &root_path);
-
-        let mut fleet_table_state = TableState::default();
-        if !repos.is_empty() {
-            fleet_table_state.select(Some(0));
-        }
+    pub fn new(root_path: PathBuf, max_commits: usize, max_depth: usize) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel();
+        git_engine::start_background_scan(root_path.clone(), max_depth, tx);
 
         Self {
             root_path,
             max_commits,
+            max_depth,
             active_view: ActiveView::FleetOverview,
 
-            discovered_paths: discovered,
-            repos,
+            repos: Vec::new(),
             selected_repo_v_idx: 0,
             filter_query: String::new(),
             is_filtering: false,
-            fleet_table_state,
+            fleet_table_state: TableState::default(),
+
+            is_scanning: true,
+            scan_spinner_frame: 0,
+            scanner_rx: Some(rx),
+            total_scanned: 0,
 
             current_repo_path: None,
             current_repo_name: String::new(),
@@ -67,10 +74,61 @@ impl App {
         }
     }
 
+    /// Polls messages from the background scanner and returns newly discovered repository paths
+    pub fn poll_scanner(&mut self) -> Vec<PathBuf> {
+        let mut messages = Vec::new();
+        if let Some(rx) = &self.scanner_rx {
+            while let Ok(msg) = rx.try_recv() {
+                messages.push(msg);
+            }
+        }
+
+        let mut new_paths = Vec::new();
+        let mut needs_sort = false;
+
+        for msg in messages {
+            match msg {
+                ScannerMessage::Batch(records) => {
+                    for rec in records {
+                        new_paths.push(rec.path.clone());
+                        if let Some(existing) = self.repos.iter_mut().find(|r| r.path == rec.path) {
+                            *existing = rec;
+                        } else {
+                            self.repos.push(rec);
+                        }
+                    }
+                    needs_sort = true;
+                }
+                ScannerMessage::Finished(total) => {
+                    self.is_scanning = false;
+                    self.total_scanned = total;
+                }
+            }
+        }
+
+        if needs_sort {
+            git_engine::sort_repo_records(&mut self.repos);
+            self.sync_table_states();
+        }
+
+        new_paths
+    }
+
+    pub fn rescan(&mut self) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.is_scanning = true;
+        git_engine::start_background_scan(self.root_path.clone(), self.max_depth, tx);
+        self.scanner_rx = Some(rx);
+    }
+
     pub fn sync_table_states(&mut self) {
-        if self.visible_repo_indices().is_empty() {
+        let visible = self.visible_repo_indices();
+        if visible.is_empty() {
             self.fleet_table_state.select(None);
         } else {
+            if self.selected_repo_v_idx >= visible.len() {
+                self.selected_repo_v_idx = visible.len().saturating_sub(1);
+            }
             self.fleet_table_state.select(Some(self.selected_repo_v_idx));
         }
 
@@ -89,16 +147,6 @@ impl App {
         } else {
             self.files_table_state.select(None);
         }
-    }
-
-    pub fn rescan(&mut self) {
-        self.discovered_paths = git_engine::discover_repos(&self.root_path);
-        self.repos = git_engine::scan_all_repos_parallel(&self.discovered_paths, &self.root_path);
-        let max_v = self.visible_repo_indices().len().saturating_sub(1);
-        if self.selected_repo_v_idx > max_v {
-            self.selected_repo_v_idx = max_v;
-        }
-        self.sync_table_states();
     }
 
     pub fn visible_repo_indices(&self) -> Vec<usize> {
@@ -423,17 +471,21 @@ mod tests {
         let mut app = App {
             root_path: PathBuf::from("."),
             max_commits: 200,
+            max_depth: 5,
             active_view: ActiveView::FleetOverview,
-            discovered_paths: Vec::new(),
             repos: vec![
                 create_test_repo("filetop", "main", "feat: viewer"),
                 create_test_repo("control", "dev", "fix: logic"),
-                create_test_repo("gittop", "feat/init", "init project"),
+                create_test_repo("gitop", "feat/init", "init project"),
             ],
             selected_repo_v_idx: 0,
             filter_query: String::new(),
             is_filtering: false,
             fleet_table_state: TableState::default(),
+            is_scanning: false,
+            scan_spinner_frame: 0,
+            scanner_rx: None,
+            total_scanned: 3,
             current_repo_path: None,
             current_repo_name: String::new(),
             graph_rows: Vec::new(),
@@ -467,8 +519,8 @@ mod tests {
         let mut app = App {
             root_path: PathBuf::from("."),
             max_commits: 200,
+            max_depth: 5,
             active_view: ActiveView::FleetOverview,
-            discovered_paths: Vec::new(),
             repos: vec![
                 create_test_repo("repo1", "main", "msg"),
                 create_test_repo("repo2", "main", "msg"),
@@ -477,6 +529,10 @@ mod tests {
             filter_query: String::new(),
             is_filtering: false,
             fleet_table_state: TableState::default(),
+            is_scanning: false,
+            scan_spinner_frame: 0,
+            scanner_rx: None,
+            total_scanned: 2,
             current_repo_path: None,
             current_repo_name: String::new(),
             graph_rows: Vec::new(),
@@ -496,7 +552,7 @@ mod tests {
         assert_eq!(app.selected_repo_v_idx, 1);
 
         app.move_down();
-        assert_eq!(app.selected_repo_v_idx, 1); // clamped
+        assert_eq!(app.selected_repo_v_idx, 1);
 
         app.move_to_top();
         assert_eq!(app.selected_repo_v_idx, 0);

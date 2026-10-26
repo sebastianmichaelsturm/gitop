@@ -35,6 +35,10 @@ pub struct Args {
     /// Maximum commits to display in the repo branch graph
     #[arg(short, long, default_value_t = 200)]
     pub max_commits: usize,
+
+    /// Maximum directory depth to search for git repositories (default: 5, 0 = unlimited)
+    #[arg(short, long, default_value_t = 5)]
+    pub depth: usize,
 }
 
 fn setup_panic_hook() {
@@ -53,21 +57,29 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Set panic hook so terminal is always restored
     setup_panic_hook();
 
-    // Start background watcher
-    let watcher = RepoWatcher::new(&root_path)?;
+    // Start targeted background watcher
+    let mut watcher = RepoWatcher::new()?;
 
-    // Initialize terminal
+    // Initialize terminal immediately (< 25ms startup)
     enable_raw_mode()?;
     let mut stdout = stdout();
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new(root_path, args.max_commits);
+    let mut app = App::new(root_path, args.max_commits, args.depth);
 
     let tick_rate = Duration::from_millis(150);
 
     loop {
+        // Poll background scanner and attach watcher to any newly found repos
+        let new_repos = app.poll_scanner();
+        for p in new_repos {
+            watcher.watch_repo(p);
+        }
+
+        app.scan_spinner_frame = app.scan_spinner_frame.wrapping_add(1);
+
         terminal.draw(|f| ui::render(f, &mut app))?;
 
         // Handle keyboard events
@@ -84,16 +96,19 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                             KeyCode::Esc => {
                                 app.is_filtering = false;
                                 app.filter_query.clear();
+                                app.sync_table_states();
                             }
                             KeyCode::Enter => {
                                 app.is_filtering = false;
                             }
                             KeyCode::Backspace => {
                                 app.filter_query.pop();
+                                app.sync_table_states();
                             }
                             KeyCode::Char(c) => {
                                 app.filter_query.push(c);
                                 app.selected_repo_v_idx = 0;
+                                app.sync_table_states();
                             }
                             _ => {}
                         }
@@ -146,7 +161,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        // Process file watcher events
+        // Process targeted file watcher events
         let mut needs_refresh = false;
         while let Ok(res) = watcher.rx.try_recv() {
             if let Ok(event) = res {

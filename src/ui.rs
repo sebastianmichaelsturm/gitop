@@ -29,17 +29,29 @@ fn render_fleet_overview(f: &mut Frame, app: &mut App, area: Rect) {
         ])
         .split(area);
 
-    // Header
+    // Header with animated scanning indicator
     let dirty_count = app.repos.iter().filter(|r| r.is_dirty).count();
-    let header_text = vec![
+    let spinner_chars = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let spinner = spinner_chars[app.scan_spinner_frame % spinner_chars.len()];
+
+    let mut header_text = vec![
         Span::styled(" gitop ", Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)),
         Span::raw("  "),
-        Span::styled(format!("Total Repos: {} ", app.repos.len()), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-        Span::raw("│ "),
-        Span::styled(format!("Dirty: {} ", dirty_count), if dirty_count > 0 { Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD) } else { Style::default().fg(Color::Green) }),
-        Span::raw("│ "),
-        Span::styled(format!("Root: {} ", app.root_path.to_string_lossy()), Style::default().fg(Color::DarkGray)),
     ];
+
+    if app.is_scanning {
+        header_text.push(Span::styled(format!("{} Scanning... ", spinner), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
+        header_text.push(Span::styled(format!("(Found: {}) ", app.repos.len()), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
+        header_text.push(Span::raw("│ "));
+    } else {
+        header_text.push(Span::styled(format!("Total Repos: {} ", app.repos.len()), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)));
+        header_text.push(Span::raw("│ "));
+    }
+
+    header_text.push(Span::styled(format!("Dirty: {} ", dirty_count), if dirty_count > 0 { Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD) } else { Style::default().fg(Color::Green) }));
+    header_text.push(Span::raw("│ "));
+    header_text.push(Span::styled(format!("Root: {} (depth: {})", app.root_path.to_string_lossy(), if app.max_depth == 0 { "unlimited".to_string() } else { app.max_depth.to_string() }), Style::default().fg(Color::DarkGray)));
+
     let header_widget = Paragraph::new(Line::from(header_text))
         .block(Block::default().borders(Borders::ALL).title(" Fleet Overview "));
     f.render_widget(header_widget, chunks[0]);

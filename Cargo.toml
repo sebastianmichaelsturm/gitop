@@ -1,6 +1,25 @@
 [package]
 name = "gittop"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
+authors = ["Sebastian Sturm"]
+description = "A real-time top-like terminal dashboard for git repositories with branch graph and commit inspector"
+license = "MIT OR Apache-2.0"
 
 [dependencies]
+ratatui = "0.29"
+crossterm = "0.28"
+git2 = { version = "0.19", default-features = false }
+notify = "6.1"
+clap = { version = "4.5", features = ["derive"] }
+chrono = "0.4"
+walkdir = "2.5"
+rayon = "1.10"
+unicode-width = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

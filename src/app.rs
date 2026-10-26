@@ -1,5 +1,6 @@
 use crate::git_engine;
 use crate::model::{ActiveView, CommitDetail, CommitGraphRow, DiffViewerState, RepoRecord};
+use ratatui::widgets::TableState;
 use std::path::PathBuf;
 
 pub struct App {
@@ -13,6 +14,7 @@ pub struct App {
     pub selected_repo_v_idx: usize,
     pub filter_query: String,
     pub is_filtering: bool,
+    pub fleet_table_state: TableState,
 
     // Repo Detail
     pub current_repo_path: Option<PathBuf>,
@@ -22,6 +24,8 @@ pub struct App {
     pub commit_detail: Option<CommitDetail>,
     pub pane_focus_files: bool,
     pub selected_file_idx: usize,
+    pub graph_table_state: TableState,
+    pub files_table_state: TableState,
 
     // Diff Viewer
     pub diff_viewer: Option<DiffViewerState>,
@@ -31,6 +35,11 @@ impl App {
     pub fn new(root_path: PathBuf, max_commits: usize) -> Self {
         let discovered = git_engine::discover_repos(&root_path);
         let repos = git_engine::scan_all_repos_parallel(&discovered, &root_path);
+
+        let mut fleet_table_state = TableState::default();
+        if !repos.is_empty() {
+            fleet_table_state.select(Some(0));
+        }
 
         Self {
             root_path,
@@ -42,6 +51,7 @@ impl App {
             selected_repo_v_idx: 0,
             filter_query: String::new(),
             is_filtering: false,
+            fleet_table_state,
 
             current_repo_path: None,
             current_repo_name: String::new(),
@@ -50,8 +60,34 @@ impl App {
             commit_detail: None,
             pane_focus_files: false,
             selected_file_idx: 0,
+            graph_table_state: TableState::default(),
+            files_table_state: TableState::default(),
 
             diff_viewer: None,
+        }
+    }
+
+    pub fn sync_table_states(&mut self) {
+        if self.visible_repo_indices().is_empty() {
+            self.fleet_table_state.select(None);
+        } else {
+            self.fleet_table_state.select(Some(self.selected_repo_v_idx));
+        }
+
+        if self.graph_rows.is_empty() {
+            self.graph_table_state.select(None);
+        } else {
+            self.graph_table_state.select(Some(self.selected_commit_idx));
+        }
+
+        if let Some(detail) = &self.commit_detail {
+            if detail.files.is_empty() {
+                self.files_table_state.select(None);
+            } else {
+                self.files_table_state.select(Some(self.selected_file_idx));
+            }
+        } else {
+            self.files_table_state.select(None);
         }
     }
 
@@ -62,6 +98,7 @@ impl App {
         if self.selected_repo_v_idx > max_v {
             self.selected_repo_v_idx = max_v;
         }
+        self.sync_table_states();
     }
 
     pub fn visible_repo_indices(&self) -> Vec<usize> {
@@ -121,6 +158,7 @@ impl App {
                 }
             }
         }
+        self.sync_table_states();
     }
 
     pub fn move_down(&mut self) {
@@ -153,6 +191,7 @@ impl App {
                 }
             }
         }
+        self.sync_table_states();
     }
 
     pub fn move_page_up(&mut self) {
@@ -170,6 +209,7 @@ impl App {
                 }
             }
         }
+        self.sync_table_states();
     }
 
     pub fn move_page_down(&mut self) {
@@ -189,6 +229,7 @@ impl App {
                 }
             }
         }
+        self.sync_table_states();
     }
 
     pub fn move_to_top(&mut self) {
@@ -204,6 +245,7 @@ impl App {
                 }
             }
         }
+        self.sync_table_states();
     }
 
     pub fn move_to_bottom(&mut self) {
@@ -221,6 +263,7 @@ impl App {
                 }
             }
         }
+        self.sync_table_states();
     }
 
     pub fn on_enter(&mut self) {
@@ -237,6 +280,7 @@ impl App {
                         self.pane_focus_files = false;
                         self.selected_file_idx = 0;
                         self.on_commit_selection_changed();
+                        self.sync_table_states();
                         self.active_view = ActiveView::RepoDetail;
                     }
                 }
@@ -283,6 +327,7 @@ impl App {
         if self.is_filtering {
             self.is_filtering = false;
             self.filter_query.clear();
+            self.sync_table_states();
             return;
         }
 
@@ -296,6 +341,7 @@ impl App {
                 self.graph_rows.clear();
                 self.commit_detail = None;
                 self.current_repo_path = None;
+                self.sync_table_states();
             }
             ActiveView::FleetOverview => {}
         }
@@ -387,6 +433,7 @@ mod tests {
             selected_repo_v_idx: 0,
             filter_query: String::new(),
             is_filtering: false,
+            fleet_table_state: TableState::default(),
             current_repo_path: None,
             current_repo_name: String::new(),
             graph_rows: Vec::new(),
@@ -394,6 +441,8 @@ mod tests {
             commit_detail: None,
             pane_focus_files: false,
             selected_file_idx: 0,
+            graph_table_state: TableState::default(),
+            files_table_state: TableState::default(),
             diff_viewer: None,
         };
 
@@ -427,6 +476,7 @@ mod tests {
             selected_repo_v_idx: 0,
             filter_query: String::new(),
             is_filtering: false,
+            fleet_table_state: TableState::default(),
             current_repo_path: None,
             current_repo_name: String::new(),
             graph_rows: Vec::new(),
@@ -434,6 +484,8 @@ mod tests {
             commit_detail: None,
             pane_focus_files: false,
             selected_file_idx: 0,
+            graph_table_state: TableState::default(),
+            files_table_state: TableState::default(),
             diff_viewer: None,
         };
 

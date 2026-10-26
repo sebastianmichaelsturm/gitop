@@ -68,7 +68,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let tick_rate = Duration::from_millis(150);
 
     loop {
-        terminal.draw(|f| ui::render(f, &app))?;
+        terminal.draw(|f| ui::render(f, &mut app))?;
 
         // Handle keyboard events
         if event::poll(tick_rate)? {

@@ -8,7 +8,7 @@ use ratatui::{
     Frame,
 };
 
-pub fn render(f: &mut Frame, app: &App) {
+pub fn render(f: &mut Frame, app: &mut App) {
     match app.active_view {
         ActiveView::FleetOverview => render_fleet_overview(f, app, f.area()),
         ActiveView::RepoDetail => render_repo_detail(f, app, f.area()),
@@ -19,7 +19,7 @@ pub fn render(f: &mut Frame, app: &App) {
     }
 }
 
-fn render_fleet_overview(f: &mut Frame, app: &App, area: Rect) {
+fn render_fleet_overview(f: &mut Frame, app: &mut App, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -59,19 +59,11 @@ fn render_fleet_overview(f: &mut Frame, app: &App, area: Rect) {
     let visible_indices = app.visible_repo_indices();
     let rows: Vec<Row> = visible_indices
         .iter()
-        .enumerate()
-        .map(|(v_idx, &real_idx)| {
+        .map(|&real_idx| {
             let r = &app.repos[real_idx];
-            let is_selected = v_idx == app.selected_repo_v_idx;
 
-            let row_style = if is_selected {
-                Style::default().bg(Color::Rgb(40, 50, 70)).fg(Color::White).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::White)
-            };
-
-            let name_cell = cell_with_prefix(is_selected, &r.rel_path);
-            let branch_cell = Span::styled(&r.current_branch, Style::default().fg(Color::Green));
+            let name_cell = Span::raw(r.rel_path.clone());
+            let branch_cell = Span::styled(r.current_branch.clone(), Style::default().fg(Color::Green));
             let time_cell = Span::styled(r.formatted_time(), Style::default().fg(Color::Yellow));
             
             let status_style = if r.is_dirty {
@@ -88,7 +80,7 @@ fn render_fleet_overview(f: &mut Frame, app: &App, area: Rect) {
             };
             let sync_cell = Span::styled(r.sync_badge(), sync_style);
 
-            let msg_cell = Span::styled(&r.last_commit_message, Style::default().fg(Color::Gray));
+            let msg_cell = Span::styled(r.last_commit_message.clone(), Style::default().fg(Color::Gray));
 
             Row::new(vec![
                 name_cell,
@@ -98,7 +90,6 @@ fn render_fleet_overview(f: &mut Frame, app: &App, area: Rect) {
                 sync_cell,
                 msg_cell,
             ])
-            .style(row_style)
         })
         .collect();
 
@@ -113,8 +104,16 @@ fn render_fleet_overview(f: &mut Frame, app: &App, area: Rect) {
 
     let table = Table::new(rows, widths)
         .header(header_row)
-        .block(Block::default().borders(Borders::ALL).title(" Monitored Git Repositories (Sorted by Latest Commit) "));
-    f.render_widget(table, chunks[1]);
+        .block(Block::default().borders(Borders::ALL).title(" Monitored Git Repositories (Sorted by Latest Commit) "))
+        .row_highlight_style(
+            Style::default()
+                .bg(Color::Rgb(40, 50, 70))
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▶ ");
+
+    f.render_stateful_widget(table, chunks[1], &mut app.fleet_table_state);
 
     // Footer
     let footer_text = if app.is_filtering {
@@ -144,15 +143,7 @@ fn render_fleet_overview(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(footer_widget, chunks[2]);
 }
 
-fn cell_with_prefix(selected: bool, text: &str) -> Span<'static> {
-    if selected {
-        Span::styled(format!("▶ {}", text), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
-    } else {
-        Span::raw(format!("  {}", text))
-    }
-}
-
-fn render_repo_detail(f: &mut Frame, app: &App, area: Rect) {
+fn render_repo_detail(f: &mut Frame, app: &mut App, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -163,7 +154,7 @@ fn render_repo_detail(f: &mut Frame, app: &App, area: Rect) {
         ])
         .split(area);
 
-    let repo_name = app.current_selected_repo_name();
+    let repo_name = app.current_selected_repo_name().to_string();
     let header_widget = Paragraph::new(Line::from(vec![
         Span::styled(" REPO DETAIL ", Style::default().fg(Color::Black).bg(Color::Green).add_modifier(Modifier::BOLD)),
         Span::raw("  "),
@@ -177,17 +168,9 @@ fn render_repo_detail(f: &mut Frame, app: &App, area: Rect) {
     let graph_rows: Vec<Row> = app
         .graph_rows
         .iter()
-        .enumerate()
-        .map(|(idx, row)| {
-            let is_selected = idx == app.selected_commit_idx;
-            let style = if is_selected {
-                Style::default().bg(Color::Rgb(40, 50, 70)).fg(Color::White).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::White)
-            };
-
-            let prefix_span = Span::styled(&row.graph_prefix, Style::default().fg(Color::Cyan));
-            let hash_span = Span::styled(&row.hash, Style::default().fg(Color::Yellow));
+        .map(|row| {
+            let prefix_span = Span::styled(row.graph_prefix.clone(), Style::default().fg(Color::Cyan));
+            let hash_span = Span::styled(row.hash.clone(), Style::default().fg(Color::Yellow));
             
             let refs_str = if row.refs.is_empty() {
                 String::new()
@@ -196,9 +179,9 @@ fn render_repo_detail(f: &mut Frame, app: &App, area: Rect) {
             };
             let refs_span = Span::styled(refs_str, Style::default().fg(Color::Green).add_modifier(Modifier::BOLD));
             
-            let author_span = Span::styled(&row.author, Style::default().fg(Color::LightBlue));
-            let date_span = Span::styled(&row.relative_time, Style::default().fg(Color::DarkGray));
-            let summary_span = Span::styled(&row.summary, Style::default().fg(Color::White));
+            let author_span = Span::styled(row.author.clone(), Style::default().fg(Color::LightBlue));
+            let date_span = Span::styled(row.relative_time.clone(), Style::default().fg(Color::DarkGray));
+            let summary_span = Span::styled(row.summary.clone(), Style::default().fg(Color::White));
 
             Row::new(vec![
                 prefix_span,
@@ -208,7 +191,6 @@ fn render_repo_detail(f: &mut Frame, app: &App, area: Rect) {
                 author_span,
                 date_span,
             ])
-            .style(style)
         })
         .collect();
 
@@ -226,8 +208,16 @@ fn render_repo_detail(f: &mut Frame, app: &App, area: Rect) {
 
     let graph_table = Table::new(graph_rows, graph_widths)
         .header(graph_header)
-        .block(Block::default().borders(Borders::ALL).title(" Git Graph (Topological) "));
-    f.render_widget(graph_table, chunks[1]);
+        .block(Block::default().borders(Borders::ALL).title(" Git Graph (Topological) "))
+        .row_highlight_style(
+            Style::default()
+                .bg(Color::Rgb(40, 50, 70))
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▶ ");
+
+    f.render_stateful_widget(graph_table, chunks[1], &mut app.graph_table_state);
 
     // Bottom Split: Commit Info Left 55%, Files Right 45%
     let bottom_chunks = Layout::default()
@@ -262,15 +252,7 @@ fn render_repo_detail(f: &mut Frame, app: &App, area: Rect) {
         let file_rows: Vec<Row> = detail
             .files
             .iter()
-            .enumerate()
-            .map(|(f_idx, file)| {
-                let is_sel = f_idx == app.selected_file_idx && app.pane_focus_files;
-                let style = if is_sel {
-                    Style::default().bg(Color::Rgb(40, 50, 70)).fg(Color::White).add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(Color::White)
-                };
-
+            .map(|file| {
                 let status_style = match file.status.as_str() {
                     "A" => Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
                     "D" => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
@@ -280,7 +262,7 @@ fn render_repo_detail(f: &mut Frame, app: &App, area: Rect) {
                 let status_span = Span::styled(format!("[{}]", file.status), status_style);
                 let path_span = Span::raw(format!(" {}", file.path));
 
-                Row::new(vec![status_span, path_span]).style(style)
+                Row::new(vec![status_span, path_span])
             })
             .collect();
 
@@ -291,8 +273,16 @@ fn render_repo_detail(f: &mut Frame, app: &App, area: Rect) {
         };
 
         let files_table = Table::new(file_rows, [Constraint::Length(5), Constraint::Percentage(90)])
-            .block(Block::default().borders(Borders::ALL).title(files_title));
-        f.render_widget(files_table, bottom_chunks[1]);
+            .block(Block::default().borders(Borders::ALL).title(files_title))
+            .row_highlight_style(
+                Style::default()
+                    .bg(Color::Rgb(40, 50, 70))
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol("▶ ");
+
+        f.render_stateful_widget(files_table, bottom_chunks[1], &mut app.files_table_state);
     } else {
         let empty_widget = Paragraph::new("Loading commit details...")
             .block(Block::default().borders(Borders::ALL).title(" Commit Details "));

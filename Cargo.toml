@@ -5,6 +5,10 @@ edition = "2021"
 authors = ["Sebastian Sturm"]
 description = "A real-time top-like terminal dashboard for git repositories with branch graph and commit inspector"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/sebastianmichaelsturm/gitop"
+readme = "README.md"
+keywords = ["git", "tui", "dashboard", "terminal", "cli"]
+categories = ["command-line-utilities", "development-tools"]
 
 [[bin]]
 name = "gitop"

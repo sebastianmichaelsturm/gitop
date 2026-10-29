@@ -1,17 +1,18 @@
 pub mod app;
+pub mod git_actions;
 pub mod git_engine;
 pub mod model;
 pub mod ui;
 pub mod watcher;
 
-use app::App;
+use app::{App, ModalEvent};
 use clap::Parser;
 use crossterm::{
     event::{self, Event as CEvent, KeyCode, KeyEventKind, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use model::ActiveView;
+use model::{ActiveModal, ActiveView, RepoTab};
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::{
     fs,
@@ -91,6 +92,39 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                         break;
                     }
 
+                    // 1. If a modal is active, route keys to the modal
+                    if app.active_modal.is_some() {
+                        let modal_ev = app.handle_modal_key(key.code, key.modifiers);
+                        if let ModalEvent::LaunchEditor { repo_path, initial_msg } = modal_ev {
+                            // Suspend terminal raw mode and leave alternate screen
+                            disable_raw_mode()?;
+                            execute!(std::io::stdout(), LeaveAlternateScreen)?;
+                            terminal.show_cursor()?;
+
+                            let editor_res = git_actions::open_editor_for_commit(&repo_path, &initial_msg);
+
+                            // Restore terminal
+                            enable_raw_mode()?;
+                            execute!(std::io::stdout(), EnterAlternateScreen)?;
+                            terminal.hide_cursor()?;
+                            terminal.clear()?;
+
+                            match editor_res {
+                                Ok(msg) => {
+                                    if let Some(ActiveModal::Commit { message, cursor_pos, .. }) = &mut app.active_modal {
+                                        *message = msg.clone();
+                                        *cursor_pos = msg.len();
+                                    }
+                                }
+                                Err(err) => {
+                                    app.set_status_message(format!("Editor error: {}", err), true);
+                                }
+                            }
+                        }
+                        continue;
+                    }
+
+                    // 2. If filtering in Fleet Overview
                     if app.is_filtering {
                         match key.code {
                             KeyCode::Esc => {
@@ -112,49 +146,112 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                             }
                             _ => {}
                         }
-                    } else {
-                        match key.code {
-                            KeyCode::Char('q') => match app.active_view {
-                                ActiveView::FleetOverview => break,
-                                _ => app.on_esc(),
-                            },
-                            KeyCode::Esc => app.on_esc(),
-                            KeyCode::Char('/') => {
-                                if app.active_view == ActiveView::FleetOverview {
-                                    app.is_filtering = true;
-                                }
-                            }
-                            KeyCode::Char('r') => {
-                                app.rescan();
-                            }
-                            KeyCode::Tab => {
-                                app.switch_pane();
-                            }
-                            KeyCode::Char('d') | KeyCode::Char('t') => {
-                                app.toggle_diff_mode();
-                            }
-                            KeyCode::Enter => {
-                                app.on_enter();
-                            }
-                            KeyCode::Up | KeyCode::Char('k') => {
-                                app.move_up();
-                            }
-                            KeyCode::Down | KeyCode::Char('j') => {
-                                app.move_down();
-                            }
-                            KeyCode::PageUp | KeyCode::Char('b') => {
-                                app.move_page_up();
-                            }
-                            KeyCode::PageDown | KeyCode::Char('f') => {
-                                app.move_page_down();
-                            }
-                            KeyCode::Home | KeyCode::Char('g') => {
-                                app.move_to_top();
-                            }
-                            KeyCode::End | KeyCode::Char('G') => {
-                                app.move_to_bottom();
-                            }
+                        continue;
+                    }
+
+                    // 3. Navigation & Actions by View
+                    match app.active_view {
+                        ActiveView::FleetOverview => match key.code {
+                            KeyCode::Char('q') => break,
+                            KeyCode::Char('/') => app.is_filtering = true,
+                            KeyCode::Char('r') => app.rescan(),
+                            KeyCode::Enter => app.on_enter(),
+                            KeyCode::Up | KeyCode::Char('k') => app.move_up(),
+                            KeyCode::Down | KeyCode::Char('j') => app.move_down(),
+                            KeyCode::PageUp | KeyCode::Char('b') => app.move_page_up(),
+                            KeyCode::PageDown | KeyCode::Char('f') => app.move_page_down(),
+                            KeyCode::Home | KeyCode::Char('g') => app.move_to_top(),
+                            KeyCode::End | KeyCode::Char('G') => app.move_to_bottom(),
                             _ => {}
+                        },
+                        ActiveView::DiffViewer => match key.code {
+                            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => app.on_esc(),
+                            KeyCode::Tab | KeyCode::Char('d') | KeyCode::Char('t') => app.toggle_diff_mode(),
+                            KeyCode::Up | KeyCode::Char('k') => app.move_up(),
+                            KeyCode::Down | KeyCode::Char('j') => app.move_down(),
+                            KeyCode::PageUp | KeyCode::Char('b') => app.move_page_up(),
+                            KeyCode::PageDown | KeyCode::Char('f') => app.move_page_down(),
+                            KeyCode::Home | KeyCode::Char('g') => app.move_to_top(),
+                            KeyCode::End | KeyCode::Char('G') => app.move_to_bottom(),
+                            _ => {}
+                        },
+                        ActiveView::RepoDetail => {
+                            // Clear any previous transient status message on new user key
+                            app.clear_status_message();
+
+                            match key.code {
+                                KeyCode::Esc | KeyCode::Char('q') => app.on_esc(),
+                                KeyCode::Char('?') => app.open_help_modal(),
+
+                                // Tab switching: 1, 2, 3, 4, [, ]
+                                KeyCode::Char('1') => app.set_repo_tab(RepoTab::Graph),
+                                KeyCode::Char('2') => app.set_repo_tab(RepoTab::Status),
+                                KeyCode::Char('3') => app.set_repo_tab(RepoTab::Branches),
+                                KeyCode::Char('4') => app.set_repo_tab(RepoTab::Stash),
+                                KeyCode::Char('[') => app.prev_repo_tab(),
+                                KeyCode::Char(']') => app.next_repo_tab(),
+
+                                // Global git remotes actions
+                                KeyCode::Char('P') => app.push_repo(),
+                                KeyCode::Char('p') if app.current_tab != RepoTab::Stash => app.pull_repo(),
+                                KeyCode::Char('f') | KeyCode::Char('F') => app.fetch_repo(),
+                                KeyCode::Char('r') => app.refresh_all_repo_data(),
+
+                                // View-specific keybindings
+                                KeyCode::Tab => app.switch_pane(),
+                                KeyCode::Enter => app.on_enter(),
+
+                                // Tab 2: Status & Staging keys
+                                KeyCode::Char(' ') if app.current_tab == RepoTab::Status => {
+                                    app.toggle_stage_selected();
+                                }
+                                KeyCode::Char('a') if app.current_tab == RepoTab::Status => {
+                                    app.stage_all();
+                                }
+                                KeyCode::Char('A') if app.current_tab == RepoTab::Status => {
+                                    app.unstage_all();
+                                }
+                                KeyCode::Char('c') if app.current_tab == RepoTab::Status => {
+                                    app.open_commit_modal(false);
+                                }
+                                KeyCode::Char('C') if app.current_tab == RepoTab::Status => {
+                                    app.open_commit_modal(true);
+                                }
+                                KeyCode::Char('x') if app.current_tab == RepoTab::Status => {
+                                    app.open_discard_confirm();
+                                }
+
+                                // Tab 3: Branches keys
+                                KeyCode::Char('n') if app.current_tab == RepoTab::Branches => {
+                                    app.open_new_branch_modal();
+                                }
+                                KeyCode::Char('d') if app.current_tab == RepoTab::Branches => {
+                                    app.open_delete_branch_confirm();
+                                }
+                                KeyCode::Char(' ') if app.current_tab == RepoTab::Branches => {
+                                    app.checkout_selected_branch();
+                                }
+
+                                // Tab 4: Stash keys
+                                KeyCode::Char('s') if app.current_tab == RepoTab::Stash => {
+                                    app.open_stash_save_modal();
+                                }
+                                KeyCode::Char('p') if app.current_tab == RepoTab::Stash => {
+                                    app.pop_selected_stash();
+                                }
+                                KeyCode::Char('d') if app.current_tab == RepoTab::Stash => {
+                                    app.open_drop_stash_confirm();
+                                }
+
+                                // Navigation
+                                KeyCode::Up | KeyCode::Char('k') => app.move_up(),
+                                KeyCode::Down | KeyCode::Char('j') => app.move_down(),
+                                KeyCode::PageUp | KeyCode::Char('b') => app.move_page_up(),
+                                KeyCode::PageDown => app.move_page_down(),
+                                KeyCode::Home | KeyCode::Char('g') => app.move_to_top(),
+                                KeyCode::End | KeyCode::Char('G') => app.move_to_bottom(),
+                                _ => {}
+                            }
                         }
                     }
                 }

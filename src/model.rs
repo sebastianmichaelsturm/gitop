@@ -129,10 +129,185 @@ pub struct DiffLine {
     pub line_number: Option<usize>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepoTab {
+    Graph,    // [1] Log & Commit Graph (Default)
+    Status,   // [2] Status & Staging
+    Branches, // [3] Branches
+    Stash,    // [4] Stashes
+}
+
+impl RepoTab {
+    pub fn title(&self) -> &'static str {
+        match self {
+            RepoTab::Graph => "1: Log & Graph",
+            RepoTab::Status => "2: Status & Staging",
+            RepoTab::Branches => "3: Branches",
+            RepoTab::Stash => "4: Stashes",
+        }
+    }
+
+    pub fn next(&self) -> Self {
+        match self {
+            RepoTab::Graph => RepoTab::Status,
+            RepoTab::Status => RepoTab::Branches,
+            RepoTab::Branches => RepoTab::Stash,
+            RepoTab::Stash => RepoTab::Graph,
+        }
+    }
+
+    pub fn prev(&self) -> Self {
+        match self {
+            RepoTab::Graph => RepoTab::Stash,
+            RepoTab::Status => RepoTab::Graph,
+            RepoTab::Branches => RepoTab::Status,
+            RepoTab::Stash => RepoTab::Branches,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusSection {
+    Staged,
+    Unstaged,
+    Untracked,
+}
+
+impl StatusSection {
+    pub fn next(&self) -> Self {
+        match self {
+            StatusSection::Staged => StatusSection::Unstaged,
+            StatusSection::Unstaged => StatusSection::Untracked,
+            StatusSection::Untracked => StatusSection::Staged,
+        }
+    }
+
+    pub fn prev(&self) -> Self {
+        match self {
+            StatusSection::Staged => StatusSection::Untracked,
+            StatusSection::Unstaged => StatusSection::Staged,
+            StatusSection::Untracked => StatusSection::Unstaged,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileChangeKind {
+    Modified,
+    Added,
+    Deleted,
+    Renamed,
+    Untracked,
+    TypeChanged,
+}
+
+impl FileChangeKind {
+    pub fn badge(&self) -> &'static str {
+        match self {
+            FileChangeKind::Modified => "M",
+            FileChangeKind::Added => "A",
+            FileChangeKind::Deleted => "D",
+            FileChangeKind::Renamed => "R",
+            FileChangeKind::Untracked => "?",
+            FileChangeKind::TypeChanged => "T",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatusFileItem {
+    pub path: String,
+    pub original_path: Option<String>,
+    pub kind: FileChangeKind,
+    pub is_staged: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RepoStatus {
+    pub staged: Vec<StatusFileItem>,
+    pub unstaged: Vec<StatusFileItem>,
+    pub untracked: Vec<StatusFileItem>,
+}
+
+impl RepoStatus {
+    pub fn total_count(&self) -> usize {
+        self.staged.len() + self.unstaged.len() + self.untracked.len()
+    }
+
+    pub fn section_items(&self, section: StatusSection) -> &[StatusFileItem] {
+        match section {
+            StatusSection::Staged => &self.staged,
+            StatusSection::Unstaged => &self.unstaged,
+            StatusSection::Untracked => &self.untracked,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchItem {
+    pub name: String,
+    pub is_current: bool,
+    pub is_remote: bool,
+    pub upstream: Option<String>,
+    pub ahead: usize,
+    pub behind: usize,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StashItem {
+    pub index: usize,
+    pub selector: String,
+    pub message: String,
+    pub date: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfirmAction {
+    DiscardFile { path: String, is_untracked: bool },
+    DiscardAll,
+    DeleteBranch { name: String, is_remote: bool },
+    DropStash { index: usize },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActiveModal {
+    Commit {
+        message: String,
+        amend: bool,
+        cursor_pos: usize,
+    },
+    NewBranch {
+        name: String,
+        checkout: bool,
+    },
+    Confirm {
+        title: String,
+        prompt: String,
+        action: ConfirmAction,
+    },
+    Help,
+    CommandResult {
+        title: String,
+        output: String,
+        is_error: bool,
+        scroll: usize,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiffSource {
+    Commit { hash: String, file: Option<String> },
+    WorkingTree { file: String, staged: bool },
+    Untracked { file: String },
+    Stash { selector: String },
+}
+
 #[derive(Debug, Clone)]
 pub struct DiffViewerState {
     pub file_title: String,
     pub commit_hash: String,
+    pub source: Option<DiffSource>,
     pub full_lines: Vec<DiffLine>,
     pub diff_only_lines: Vec<DiffLine>,
     pub diff_only: bool,
@@ -145,11 +320,17 @@ impl DiffViewerState {
         Self {
             file_title,
             commit_hash,
+            source: None,
             full_lines,
             diff_only_lines,
             diff_only: has_diffs,
             scroll: 0,
         }
+    }
+
+    pub fn with_source(mut self, source: DiffSource) -> Self {
+        self.source = Some(source);
+        self
     }
 
     pub fn active_lines(&self) -> &[DiffLine] {
@@ -229,5 +410,53 @@ mod tests {
         viewer.toggle_mode();
         // Since diff_only has 1 item, scroll should clamp to 0
         assert_eq!(viewer.scroll, 0);
+    }
+
+    #[test]
+    fn test_repo_tab_navigation() {
+        let tab = RepoTab::Graph;
+        assert_eq!(tab.next(), RepoTab::Status);
+        assert_eq!(tab.next().next(), RepoTab::Branches);
+        assert_eq!(tab.next().next().next(), RepoTab::Stash);
+        assert_eq!(tab.next().next().next().next(), RepoTab::Graph);
+        assert_eq!(tab.prev(), RepoTab::Stash);
+    }
+
+    #[test]
+    fn test_status_section_navigation() {
+        let sec = StatusSection::Staged;
+        assert_eq!(sec.next(), StatusSection::Unstaged);
+        assert_eq!(sec.next().next(), StatusSection::Untracked);
+        assert_eq!(sec.next().next().next(), StatusSection::Staged);
+        assert_eq!(sec.prev(), StatusSection::Untracked);
+    }
+
+    #[test]
+    fn test_repo_status_counts() {
+        let status = RepoStatus {
+            staged: vec![StatusFileItem {
+                path: "file1.rs".into(),
+                original_path: None,
+                kind: FileChangeKind::Added,
+                is_staged: true,
+            }],
+            unstaged: vec![StatusFileItem {
+                path: "file2.rs".into(),
+                original_path: None,
+                kind: FileChangeKind::Modified,
+                is_staged: false,
+            }],
+            untracked: vec![StatusFileItem {
+                path: "file3.rs".into(),
+                original_path: None,
+                kind: FileChangeKind::Untracked,
+                is_staged: false,
+            }],
+        };
+
+        assert_eq!(status.total_count(), 3);
+        assert_eq!(status.section_items(StatusSection::Staged).len(), 1);
+        assert_eq!(status.section_items(StatusSection::Unstaged).len(), 1);
+        assert_eq!(status.section_items(StatusSection::Untracked).len(), 1);
     }
 }

@@ -1,5 +1,7 @@
 use crate::app::App;
-use crate::model::{ActiveView, DiffLineKind};
+use crate::model::{
+    ActiveModal, ActiveView, ConfirmAction, DiffLineKind, DiffViewerState, RepoTab, StatusSection,
+};
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -17,7 +19,15 @@ pub fn render(f: &mut Frame, app: &mut App) {
             render_diff_modal(f, app, f.area());
         }
     }
+
+    if let Some(modal) = &app.active_modal {
+        render_active_modal(f, modal, app, f.area());
+    }
 }
+
+// =========================================================================
+// 1. FLEET OVERVIEW
+// =========================================================================
 
 fn render_fleet_overview(f: &mut Frame, app: &mut App, area: Rect) {
     let chunks = Layout::default()
@@ -155,28 +165,177 @@ fn render_fleet_overview(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_widget(footer_widget, chunks[2]);
 }
 
+// =========================================================================
+// 2. REPO DETAIL & TABS
+// =========================================================================
+
 fn render_repo_detail(f: &mut Frame, app: &mut App, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3), // Header
-            Constraint::Percentage(60), // Graph & Commits
-            Constraint::Percentage(35), // Details & Files
-            Constraint::Length(1), // Footer
+            Constraint::Length(3), // Tab switcher bar
+            Constraint::Min(5),    // Main Content
+            Constraint::Length(2), // Status message + Keybinding footer
         ])
         .split(area);
 
     let repo_name = app.current_selected_repo_name().to_string();
+    let current_branch = app.branches.iter().find(|b| b.is_current).map(|b| b.name.as_str()).unwrap_or("HEAD");
+    let dirty_total = app.repo_status.total_count();
+
+    let status_badge = if dirty_total > 0 {
+        Span::styled(format!("* dirty ({})", dirty_total), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+    } else {
+        Span::styled("clean", Style::default().fg(Color::Green))
+    };
+
     let header_widget = Paragraph::new(Line::from(vec![
-        Span::styled(" REPO DETAIL ", Style::default().fg(Color::Black).bg(Color::Green).add_modifier(Modifier::BOLD)),
+        Span::styled(" GIT CLIENT ", Style::default().fg(Color::Black).bg(Color::Green).add_modifier(Modifier::BOLD)),
         Span::raw("  "),
         Span::styled(repo_name, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-        Span::raw(" │ All Branches & Commit Graph"),
+        Span::raw(" │ Branch: "),
+        Span::styled(current_branch, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::raw(" │ Status: "),
+        status_badge,
     ]))
     .block(Block::default().borders(Borders::ALL).title(" Repository Inspector "));
     f.render_widget(header_widget, chunks[0]);
 
-    // Graph Area
+    // Tab Bar
+    let tabs = [
+        (RepoTab::Graph, format!(" [1] Log & Graph ({}) ", app.graph_rows.len())),
+        (RepoTab::Status, format!(" [2] Status & Staging ({}) ", app.repo_status.total_count())),
+        (RepoTab::Branches, format!(" [3] Branches ({}) ", app.branches.len())),
+        (RepoTab::Stash, format!(" [4] Stashes ({}) ", app.stashes.len())),
+    ];
+
+    let mut tab_spans = Vec::new();
+    for (tab, label) in tabs {
+        if app.current_tab == tab {
+            tab_spans.push(Span::styled(
+                label,
+                Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ));
+        } else {
+            tab_spans.push(Span::styled(
+                label,
+                Style::default().fg(Color::Gray).bg(Color::Rgb(30, 35, 45)),
+            ));
+        }
+        tab_spans.push(Span::raw("  "));
+    }
+    tab_spans.push(Span::styled("  [1-4 / [ / ] to switch tabs]", Style::default().fg(Color::DarkGray)));
+
+    let tab_bar_widget = Paragraph::new(Line::from(tab_spans))
+        .block(Block::default().borders(Borders::ALL).title(" Views "));
+    f.render_widget(tab_bar_widget, chunks[1]);
+
+    // Main Content Chunk
+    match app.current_tab {
+        RepoTab::Graph => render_tab_graph(f, app, chunks[2]),
+        RepoTab::Status => render_tab_status(f, app, chunks[2]),
+        RepoTab::Branches => render_tab_branches(f, app, chunks[2]),
+        RepoTab::Stash => render_tab_stash(f, app, chunks[2]),
+    }
+
+    // Footer & Status message
+    let footer_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Length(1)])
+        .split(chunks[3]);
+
+    if let Some((msg, is_error)) = &app.status_message {
+        let style = if *is_error {
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+        };
+        let msg_widget = Paragraph::new(Line::from(Span::styled(format!(" ▶ {}", msg), style)));
+        f.render_widget(msg_widget, footer_chunks[0]);
+    } else {
+        let hint_line = match app.current_tab {
+            RepoTab::Graph => "Tab 1: Log & Graph (Primary Monitor View)",
+            RepoTab::Status => "Tab 2: Interactive Staging & Working Tree",
+            RepoTab::Branches => "Tab 3: Branch Switching & Management",
+            RepoTab::Stash => "Tab 4: Stash Stack",
+        };
+        let msg_widget = Paragraph::new(Line::from(Span::styled(format!(" {}", hint_line), Style::default().fg(Color::DarkGray))));
+        f.render_widget(msg_widget, footer_chunks[0]);
+    }
+
+    let footer_text = match app.current_tab {
+        RepoTab::Graph => vec![
+            Span::styled("[Enter] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::raw("Diff  "),
+            Span::styled("[Tab] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::raw("Focus (Graph ⇄ Files)  "),
+            Span::styled("[P/p/f] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::raw("Push/Pull/Fetch  "),
+            Span::styled("[?] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::raw("Help  "),
+            Span::styled("[Esc/q] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::raw("Back to Fleet"),
+        ],
+        RepoTab::Status => vec![
+            Span::styled("[Space] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::raw("Stage/Unstage  "),
+            Span::styled("[a/A] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::raw("Stage/Unstage All  "),
+            Span::styled("[c] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::raw("Commit  "),
+            Span::styled("[Enter] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::raw("Full Diff  "),
+            Span::styled("[x] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::raw("Discard  "),
+            Span::styled("[Tab] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::raw("Section  "),
+            Span::styled("[?] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::raw("Help"),
+        ],
+        RepoTab::Branches => vec![
+            Span::styled("[Enter/Space] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::raw("Checkout  "),
+            Span::styled("[n] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::raw("New Branch  "),
+            Span::styled("[d] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::raw("Delete Branch  "),
+            Span::styled("[P/p/f] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::raw("Push/Pull/Fetch  "),
+            Span::styled("[?] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::raw("Help"),
+        ],
+        RepoTab::Stash => vec![
+            Span::styled("[s] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::raw("Save Stash  "),
+            Span::styled("[p] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::raw("Pop Stash  "),
+            Span::styled("[d] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::raw("Drop Stash  "),
+            Span::styled("[Enter] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::raw("Diff  "),
+            Span::styled("[?] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::raw("Help"),
+        ],
+    };
+
+    let footer_widget = Paragraph::new(Line::from(footer_text));
+    f.render_widget(footer_widget, footer_chunks[1]);
+}
+
+// -------------------------------------------------------------------------
+// Tab 1: Log & Commit Graph
+// -------------------------------------------------------------------------
+
+fn render_tab_graph(f: &mut Frame, app: &mut App, area: Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(62), // Graph & Commits
+            Constraint::Percentage(38), // Details & Files
+        ])
+        .split(area);
+
     let graph_rows: Vec<Row> = app
         .graph_rows
         .iter()
@@ -229,13 +388,13 @@ fn render_repo_detail(f: &mut Frame, app: &mut App, area: Rect) {
         )
         .highlight_symbol("▶ ");
 
-    f.render_stateful_widget(graph_table, chunks[1], &mut app.graph_table_state);
+    f.render_stateful_widget(graph_table, chunks[0], &mut app.graph_table_state);
 
     // Bottom Split: Commit Info Left 55%, Files Right 45%
     let bottom_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
-        .split(chunks[2]);
+        .split(chunks[1]);
 
     if let Some(detail) = &app.commit_detail {
         let info_lines = vec![
@@ -296,25 +455,314 @@ fn render_repo_detail(f: &mut Frame, app: &mut App, area: Rect) {
 
         f.render_stateful_widget(files_table, bottom_chunks[1], &mut app.files_table_state);
     } else {
-        let empty_widget = Paragraph::new("Loading commit details...")
+        let empty_widget = Paragraph::new("No commit selected")
             .block(Block::default().borders(Borders::ALL).title(" Commit Details "));
         f.render_widget(empty_widget, bottom_chunks[0]);
     }
-
-    // Footer
-    let footer_text = vec![
-        Span::styled("[Enter] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        Span::raw("View Diff  "),
-        Span::styled("[Tab] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        Span::raw("Switch Focus (Graph ⇄ Files)  "),
-        Span::styled("[Esc/q] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        Span::raw("Back to Fleet Overview  "),
-        Span::styled("[↑/↓] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        Span::raw("Navigate"),
-    ];
-    let footer_widget = Paragraph::new(Line::from(footer_text));
-    f.render_widget(footer_widget, chunks[3]);
 }
+
+// -------------------------------------------------------------------------
+// Tab 2: Status & Staging
+// -------------------------------------------------------------------------
+
+fn render_tab_status(f: &mut Frame, app: &mut App, area: Rect) {
+    let main_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
+        .split(area);
+
+    // Left: Staged, Unstaged, Untracked sections
+    let left_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(33),
+            Constraint::Percentage(37),
+            Constraint::Percentage(30),
+        ])
+        .split(main_chunks[0]);
+
+    // 1. Staged
+    let is_staged_focused = app.status_section == StatusSection::Staged;
+    let staged_rows: Vec<Row> = app
+        .repo_status
+        .staged
+        .iter()
+        .map(|item| {
+            let b = Span::styled(format!("[{}]", item.kind.badge()), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD));
+            let p = Span::styled(format!(" {}", item.path), Style::default().fg(Color::White));
+            Row::new(vec![b, p])
+        })
+        .collect();
+
+    let staged_title = format!(" Staged Changes ({}) [Space to unstage] ", app.repo_status.staged.len());
+    let staged_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(if is_staged_focused { Style::default().fg(Color::Green).add_modifier(Modifier::BOLD) } else { Style::default().fg(Color::DarkGray) })
+        .title(staged_title);
+
+    let staged_table = Table::new(staged_rows, [Constraint::Length(5), Constraint::Percentage(90)])
+        .block(staged_block)
+        .row_highlight_style(
+            Style::default()
+                .bg(Color::Rgb(30, 60, 40))
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▶ ");
+    f.render_stateful_widget(staged_table, left_chunks[0], &mut app.staged_table_state);
+
+    // 2. Unstaged
+    let is_unstaged_focused = app.status_section == StatusSection::Unstaged;
+    let unstaged_rows: Vec<Row> = app
+        .repo_status
+        .unstaged
+        .iter()
+        .map(|item| {
+            let b = Span::styled(format!("[{}]", item.kind.badge()), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
+            let p = Span::styled(format!(" {}", item.path), Style::default().fg(Color::White));
+            Row::new(vec![b, p])
+        })
+        .collect();
+
+    let unstaged_title = format!(" Unstaged Changes ({}) [Space to stage] ", app.repo_status.unstaged.len());
+    let unstaged_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(if is_unstaged_focused { Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD) } else { Style::default().fg(Color::DarkGray) })
+        .title(unstaged_title);
+
+    let unstaged_table = Table::new(unstaged_rows, [Constraint::Length(5), Constraint::Percentage(90)])
+        .block(unstaged_block)
+        .row_highlight_style(
+            Style::default()
+                .bg(Color::Rgb(60, 50, 30))
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▶ ");
+    f.render_stateful_widget(unstaged_table, left_chunks[1], &mut app.unstaged_table_state);
+
+    // 3. Untracked
+    let is_untracked_focused = app.status_section == StatusSection::Untracked;
+    let untracked_rows: Vec<Row> = app
+        .repo_status
+        .untracked
+        .iter()
+        .map(|item| {
+            let b = Span::styled("[?]", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD));
+            let p = Span::styled(format!(" {}", item.path), Style::default().fg(Color::White));
+            Row::new(vec![b, p])
+        })
+        .collect();
+
+    let untracked_title = format!(" Untracked Files ({}) [Space to track] ", app.repo_status.untracked.len());
+    let untracked_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(if is_untracked_focused { Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD) } else { Style::default().fg(Color::DarkGray) })
+        .title(untracked_title);
+
+    let untracked_table = Table::new(untracked_rows, [Constraint::Length(5), Constraint::Percentage(90)])
+        .block(untracked_block)
+        .row_highlight_style(
+            Style::default()
+                .bg(Color::Rgb(50, 30, 60))
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▶ ");
+    f.render_stateful_widget(untracked_table, left_chunks[2], &mut app.untracked_table_state);
+
+    // Right: Live Diff Preview
+    render_diff_preview(f, app.status_preview_diff.as_ref(), main_chunks[1]);
+}
+
+fn render_diff_preview(f: &mut Frame, preview: Option<&DiffViewerState>, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(match preview {
+            Some(p) => format!(" Diff Preview: {} [Enter for Full View] ", p.file_title),
+            None => " Diff Preview ".to_string(),
+        });
+
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if let Some(viewer) = preview {
+        let active_lines = viewer.active_lines();
+        let height = inner.height as usize;
+        let visible_slice = if active_lines.is_empty() {
+            &[]
+        } else {
+            let start = viewer.scroll.min(active_lines.len().saturating_sub(1));
+            let end = (start + height).min(active_lines.len());
+            &active_lines[start..end]
+        };
+
+        let text_lines: Vec<Line> = visible_slice
+            .iter()
+            .map(|line| {
+                let line_no_str = match line.line_number {
+                    Some(n) => format!("{:4} │ ", n),
+                    None => "     │ ".to_string(),
+                };
+
+                match line.kind {
+                    DiffLineKind::Addition => Line::from(vec![
+                        Span::styled(line_no_str, Style::default().fg(Color::DarkGray)),
+                        Span::styled(&line.content, Style::default().fg(Color::Green)),
+                    ]),
+                    DiffLineKind::Deletion => Line::from(vec![
+                        Span::styled(line_no_str, Style::default().fg(Color::DarkGray)),
+                        Span::styled(&line.content, Style::default().fg(Color::Red)),
+                    ]),
+                    DiffLineKind::Hunk => Line::from(vec![
+                        Span::styled(line_no_str, Style::default().fg(Color::DarkGray)),
+                        Span::styled(&line.content, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                    ]),
+                    DiffLineKind::Info => Line::from(vec![
+                        Span::styled(line_no_str, Style::default().fg(Color::DarkGray)),
+                        Span::styled(&line.content, Style::default().fg(Color::Yellow)),
+                    ]),
+                    DiffLineKind::Context => Line::from(vec![
+                        Span::styled(line_no_str, Style::default().fg(Color::DarkGray)),
+                        Span::styled(&line.content, Style::default().fg(Color::White)),
+                    ]),
+                }
+            })
+            .collect();
+
+        let paragraph = Paragraph::new(text_lines);
+        f.render_widget(paragraph, inner);
+    } else {
+        let empty = Paragraph::new("No file selected or working tree clean")
+            .style(Style::default().fg(Color::DarkGray))
+            .alignment(Alignment::Center);
+        f.render_widget(empty, inner);
+    }
+}
+
+// -------------------------------------------------------------------------
+// Tab 3: Branches
+// -------------------------------------------------------------------------
+
+fn render_tab_branches(f: &mut Frame, app: &mut App, area: Rect) {
+    let header_row = Row::new(vec!["CURRENT", "BRANCH NAME", "UPSTREAM TRACKING", "SYNC", "LATEST COMMIT SUMMARY"])
+        .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+
+    let rows: Vec<Row> = app
+        .branches
+        .iter()
+        .map(|b| {
+            let current_span = if b.is_current {
+                Span::styled("*", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
+            } else {
+                Span::raw(" ")
+            };
+
+            let name_style = if b.is_current {
+                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+            } else if b.is_remote {
+                Style::default().fg(Color::Magenta)
+            } else {
+                Style::default().fg(Color::Cyan)
+            };
+            let name_span = Span::styled(&b.name, name_style);
+
+            let upstream_span = Span::styled(
+                b.upstream.as_deref().unwrap_or("-"),
+                Style::default().fg(Color::DarkGray),
+            );
+
+            let sync_str = if b.ahead == 0 && b.behind == 0 {
+                "✓".to_string()
+            } else {
+                let mut s = String::new();
+                if b.ahead > 0 { s.push_str(&format!("↑{}", b.ahead)); }
+                if b.behind > 0 {
+                    if !s.is_empty() { s.push(' '); }
+                    s.push_str(&format!("↓{}", b.behind));
+                }
+                s
+            };
+            let sync_style = if b.ahead > 0 || b.behind > 0 {
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Green)
+            };
+            let sync_span = Span::styled(sync_str, sync_style);
+
+            let summary_span = Span::styled(&b.summary, Style::default().fg(Color::Gray));
+
+            Row::new(vec![current_span, name_span, upstream_span, sync_span, summary_span])
+        })
+        .collect();
+
+    let widths = [
+        Constraint::Length(8),
+        Constraint::Length(26),
+        Constraint::Length(26),
+        Constraint::Length(10),
+        Constraint::Percentage(45),
+    ];
+
+    let table = Table::new(rows, widths)
+        .header(header_row)
+        .block(Block::default().borders(Borders::ALL).title(" Local & Remote Branches [Enter/Space: Checkout, n: New, d: Delete] "))
+        .row_highlight_style(
+            Style::default()
+                .bg(Color::Rgb(40, 50, 70))
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▶ ");
+
+    f.render_stateful_widget(table, area, &mut app.branches_table_state);
+}
+
+// -------------------------------------------------------------------------
+// Tab 4: Stashes
+// -------------------------------------------------------------------------
+
+fn render_tab_stash(f: &mut Frame, app: &mut App, area: Rect) {
+    let header_row = Row::new(vec!["INDEX", "SELECTOR", "DATE", "MESSAGE"])
+        .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+
+    let rows: Vec<Row> = app
+        .stashes
+        .iter()
+        .map(|s| {
+            let idx_span = Span::styled(format!("#{}", s.index), Style::default().fg(Color::DarkGray));
+            let sel_span = Span::styled(&s.selector, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+            let date_span = Span::styled(&s.date, Style::default().fg(Color::Yellow));
+            let msg_span = Span::styled(&s.message, Style::default().fg(Color::White));
+
+            Row::new(vec![idx_span, sel_span, date_span, msg_span])
+        })
+        .collect();
+
+    let widths = [
+        Constraint::Length(7),
+        Constraint::Length(14),
+        Constraint::Length(16),
+        Constraint::Percentage(65),
+    ];
+
+    let table = Table::new(rows, widths)
+        .header(header_row)
+        .block(Block::default().borders(Borders::ALL).title(" Stash Stack [s: Save Stash, p: Pop, d: Drop, Enter: View Diff] "))
+        .row_highlight_style(
+            Style::default()
+                .bg(Color::Rgb(40, 50, 70))
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▶ ");
+
+    f.render_stateful_widget(table, area, &mut app.stashes_table_state);
+}
+
+// =========================================================================
+// 3. DIFF VIEWER MODAL
+// =========================================================================
 
 fn render_diff_modal(f: &mut Frame, app: &App, area: Rect) {
     let viewer = match &app.diff_viewer {
@@ -322,7 +770,7 @@ fn render_diff_modal(f: &mut Frame, app: &App, area: Rect) {
         None => return,
     };
 
-    let modal_area = centered_rect(88, 85, area);
+    let modal_area = centered_rect(90, 85, area);
     f.render_widget(Clear, modal_area);
 
     let mode_badge = if viewer.diff_only {
@@ -338,8 +786,8 @@ fn render_diff_modal(f: &mut Frame, app: &App, area: Rect) {
     };
 
     let title_line = Line::from(vec![
-        Span::styled(" Commit Diff: ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-        Span::styled(&viewer.commit_hash[..7.min(viewer.commit_hash.len())], Style::default().fg(Color::Yellow)),
+        Span::styled(" Diff: ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+        Span::styled(&viewer.commit_hash, Style::default().fg(Color::Yellow)),
         Span::raw(" │ "),
         Span::styled(&viewer.file_title, Style::default().fg(Color::Green)),
         mode_badge,
@@ -400,7 +848,274 @@ fn render_diff_modal(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(paragraph, inner_area);
 }
 
-fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
+// =========================================================================
+// 4. INTERACTIVE MODALS
+// =========================================================================
+
+fn render_active_modal(f: &mut Frame, modal: &ActiveModal, _app: &App, area: Rect) {
+    match modal {
+        ActiveModal::Commit {
+            message,
+            amend,
+            cursor_pos,
+        } => {
+            let modal_area = centered_rect(65, 38, area);
+            f.render_widget(Clear, modal_area);
+
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .title(" Commit Staged Changes ")
+                .title_alignment(Alignment::Center)
+                .border_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+
+            let inner = block.inner(modal_area);
+            f.render_widget(block, modal_area);
+
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(1), // prompt
+                    Constraint::Length(4), // input box
+                    Constraint::Length(2), // amend checkbox
+                    Constraint::Length(2), // controls
+                ])
+                .split(inner);
+
+            let prompt = Paragraph::new("Enter commit message:").style(Style::default().fg(Color::Yellow));
+            f.render_widget(prompt, chunks[0]);
+
+            // Text input box with cursor
+            let mut display_text = message.clone();
+            let c_pos = *cursor_pos;
+            if c_pos <= display_text.len() {
+                display_text.insert(c_pos, '█');
+            } else {
+                display_text.push('█');
+            }
+
+            let input_widget = Paragraph::new(display_text)
+                .block(Block::default().borders(Borders::ALL).title(" Message "))
+                .style(Style::default().fg(Color::White));
+            f.render_widget(input_widget, chunks[1]);
+
+            let amend_span = if *amend {
+                Span::styled("[X] Amend previous commit (Tab to toggle)", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+            } else {
+                Span::styled("[ ] Amend previous commit (Tab to toggle)", Style::default().fg(Color::DarkGray))
+            };
+            let amend_widget = Paragraph::new(Line::from(amend_span));
+            f.render_widget(amend_widget, chunks[2]);
+
+            let controls = Paragraph::new(Line::from(vec![
+                Span::styled("<Enter> ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::raw("Commit  │  "),
+                Span::styled("<Ctrl+E> ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::raw("Open in $EDITOR  │  "),
+                Span::styled("<Esc> ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::raw("Cancel"),
+            ]))
+            .alignment(Alignment::Center);
+            f.render_widget(controls, chunks[3]);
+        }
+        ActiveModal::NewBranch { name, checkout } => {
+            let modal_area = centered_rect(55, 28, area);
+            f.render_widget(Clear, modal_area);
+
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .title(" Create New Branch ")
+                .title_alignment(Alignment::Center)
+                .border_style(Style::default().fg(Color::Green).add_modifier(Modifier::BOLD));
+
+            let inner = block.inner(modal_area);
+            f.render_widget(block, modal_area);
+
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(1),
+                    Constraint::Length(3),
+                    Constraint::Length(2),
+                    Constraint::Length(1),
+                ])
+                .split(inner);
+
+            f.render_widget(Paragraph::new("Branch name:").style(Style::default().fg(Color::Yellow)), chunks[0]);
+
+            let input_text = format!("{}█", name);
+            let input_box = Paragraph::new(input_text)
+                .block(Block::default().borders(Borders::ALL))
+                .style(Style::default().fg(Color::White));
+            f.render_widget(input_box, chunks[1]);
+
+            let chk_span = if *checkout {
+                Span::styled("[X] Checkout branch after creation (Tab to toggle)", Style::default().fg(Color::Green))
+            } else {
+                Span::styled("[ ] Checkout branch after creation (Tab to toggle)", Style::default().fg(Color::DarkGray))
+            };
+            f.render_widget(Paragraph::new(Line::from(chk_span)), chunks[2]);
+
+            let controls = Paragraph::new(Line::from(vec![
+                Span::styled("<Enter> ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::raw("Create  │  "),
+                Span::styled("<Esc> ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::raw("Cancel"),
+            ]))
+            .alignment(Alignment::Center);
+            f.render_widget(controls, chunks[3]);
+        }
+        ActiveModal::Confirm { title, prompt, action } => {
+            let modal_area = centered_rect(55, 24, area);
+            f.render_widget(Clear, modal_area);
+
+            let border_color = match action {
+                ConfirmAction::DiscardFile { .. } | ConfirmAction::DiscardAll => Color::Red,
+                ConfirmAction::DeleteBranch { .. } => Color::Yellow,
+                ConfirmAction::DropStash { .. } => Color::Red,
+            };
+
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .title(format!(" {} ", title))
+                .title_alignment(Alignment::Center)
+                .border_style(Style::default().fg(border_color).add_modifier(Modifier::BOLD));
+
+            let inner = block.inner(modal_area);
+            f.render_widget(block, modal_area);
+
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Percentage(60),
+                    Constraint::Percentage(40),
+                ])
+                .split(inner);
+
+            let prompt_widget = Paragraph::new(prompt.as_str())
+                .style(Style::default().fg(Color::White).add_modifier(Modifier::BOLD))
+                .alignment(Alignment::Center)
+                .wrap(Wrap { trim: false });
+            f.render_widget(prompt_widget, chunks[0]);
+
+            let buttons = Paragraph::new(Line::from(vec![
+                Span::styled(" [ <y / Enter> Confirm ] ", Style::default().fg(Color::Black).bg(Color::Red).add_modifier(Modifier::BOLD)),
+                Span::raw("    "),
+                Span::styled(" [ <n / Esc> Cancel ] ", Style::default().fg(Color::Black).bg(Color::White)),
+            ]))
+            .alignment(Alignment::Center);
+            f.render_widget(buttons, chunks[1]);
+        }
+        ActiveModal::CommandResult {
+            title,
+            output,
+            is_error,
+            scroll,
+        } => {
+            let modal_area = centered_rect(75, 65, area);
+            f.render_widget(Clear, modal_area);
+
+            let border_color = if *is_error { Color::Red } else { Color::Green };
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .title(format!(" Output: {} ", title))
+                .title_alignment(Alignment::Center)
+                .border_style(Style::default().fg(border_color).add_modifier(Modifier::BOLD));
+
+            let inner = block.inner(modal_area);
+            f.render_widget(block, modal_area);
+
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Min(3),
+                    Constraint::Length(1),
+                ])
+                .split(inner);
+
+            let lines: Vec<Line> = output
+                .lines()
+                .skip(*scroll)
+                .map(|l| Line::from(Span::styled(l, Style::default().fg(Color::White))))
+                .collect();
+
+            let paragraph = Paragraph::new(lines);
+            f.render_widget(paragraph, chunks[0]);
+
+            let footer = Paragraph::new(Line::from(vec![
+                Span::styled("<Esc / Enter / q> ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::raw("Close  │  "),
+                Span::styled("<↑/↓> ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::raw("Scroll"),
+            ]))
+            .alignment(Alignment::Center);
+            f.render_widget(footer, chunks[1]);
+        }
+        ActiveModal::Help => {
+            let modal_area = centered_rect(82, 85, area);
+            f.render_widget(Clear, modal_area);
+
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .title(" gitop Keybindings & Cheatsheet ")
+                .title_alignment(Alignment::Center)
+                .border_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+
+            let inner = block.inner(modal_area);
+            f.render_widget(block, modal_area);
+
+            let help_text = vec![
+                Line::from(Span::styled("--- Fleet Overview ---", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
+                Line::from("  Enter               Inspect selected repository (opens Tab 1: Log & Graph)"),
+                Line::from("  /                   Search and filter monitored repositories"),
+                Line::from("  r                   Force manual rescan"),
+                Line::from("  ↑/↓, k/j, PgUp/PgDn Navigate repository list"),
+                Line::from("  q                   Quit gitop"),
+                Line::from(""),
+                Line::from(Span::styled("--- Repository Client Navigation ---", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
+                Line::from("  1                   Switch to Tab 1: Log & Graph (Primary monitor view)"),
+                Line::from("  2                   Switch to Tab 2: Status & Staging"),
+                Line::from("  3                   Switch to Tab 3: Branches"),
+                Line::from("  4                   Switch to Tab 4: Stashes"),
+                Line::from("  [ / ]               Cycle through tabs"),
+                Line::from("  P                   git push (push to tracking upstream)"),
+                Line::from("  p                   git pull (pull from tracking upstream)"),
+                Line::from("  f                   git fetch --all --prune"),
+                Line::from("  ?                   Toggle this help screen"),
+                Line::from("  Esc / q             Return to Fleet Overview"),
+                Line::from(""),
+                Line::from(Span::styled("--- Tab 2: Status & Staging ---", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
+                Line::from("  Tab                 Switch section focus (Staged ⇄ Unstaged ⇄ Untracked)"),
+                Line::from("  Space               Toggle Stage/Unstage for selected file"),
+                Line::from("  a                   Stage all changes (git add -A)"),
+                Line::from("  c                   Open Commit Modal (commit staged changes)"),
+                Line::from("  Ctrl+E (in modal)   Launch external $EDITOR for commit message"),
+                Line::from("  Enter               Open Full-Screen Diff Viewer for selected file"),
+                Line::from("  x                   Discard changes (with safety confirmation)"),
+                Line::from(""),
+                Line::from(Span::styled("--- Tab 3: Branches ---", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
+                Line::from("  Enter / Space       Checkout highlighted branch"),
+                Line::from("  n                   Create new branch"),
+                Line::from("  d                   Delete highlighted branch (with confirmation)"),
+                Line::from(""),
+                Line::from(Span::styled("--- Tab 4: Stashes ---", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
+                Line::from("  s                   Stash current changes"),
+                Line::from("  p                   Pop highlighted stash"),
+                Line::from("  d                   Drop highlighted stash (with confirmation)"),
+                Line::from("  Enter               View stash diff"),
+                Line::from(""),
+                Line::from(Span::styled("--- Diff Viewer Modal ---", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
+                Line::from("  Tab / d             Toggle Diff Mode (Diff-only vs Full-file)"),
+                Line::from("  ↑/↓, k/j, PgUp/PgDn Scroll diff lines"),
+                Line::from("  Esc / q / Enter     Close Diff Viewer"),
+            ];
+
+            let paragraph = Paragraph::new(help_text).wrap(Wrap { trim: false });
+            f.render_widget(paragraph, inner);
+        }
+    }
+}
+
+pub fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
     let popup_layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([

@@ -1,8 +1,23 @@
+use crate::git_actions;
 use crate::git_engine::{self, ScannerMessage};
-use crate::model::{ActiveView, CommitDetail, CommitGraphRow, DiffViewerState, RepoRecord};
+use crate::model::{
+    ActiveModal, ActiveView, BranchItem, CommitDetail, CommitGraphRow, ConfirmAction,
+    DiffSource, DiffViewerState, RepoRecord, RepoStatus, RepoTab, StashItem, StatusFileItem,
+    StatusSection,
+};
+use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::widgets::TableState;
 use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
+
+pub enum ModalEvent {
+    None,
+    Handled,
+    LaunchEditor {
+        repo_path: PathBuf,
+        initial_msg: String,
+    },
+}
 
 pub struct App {
     pub root_path: PathBuf,
@@ -26,6 +41,9 @@ pub struct App {
     // Repo Detail
     pub current_repo_path: Option<PathBuf>,
     pub current_repo_name: String,
+    pub current_tab: RepoTab,
+
+    // Tab 1: Graph & Commits (Default)
     pub graph_rows: Vec<CommitGraphRow>,
     pub selected_commit_idx: usize,
     pub commit_detail: Option<CommitDetail>,
@@ -33,6 +51,31 @@ pub struct App {
     pub selected_file_idx: usize,
     pub graph_table_state: TableState,
     pub files_table_state: TableState,
+
+    // Tab 2: Status & Staging
+    pub status_section: StatusSection,
+    pub selected_staged_idx: usize,
+    pub selected_unstaged_idx: usize,
+    pub selected_untracked_idx: usize,
+    pub repo_status: RepoStatus,
+    pub staged_table_state: TableState,
+    pub unstaged_table_state: TableState,
+    pub untracked_table_state: TableState,
+    pub status_preview_diff: Option<DiffViewerState>,
+
+    // Tab 3: Branches
+    pub branches: Vec<BranchItem>,
+    pub selected_branch_idx: usize,
+    pub branches_table_state: TableState,
+
+    // Tab 4: Stashes
+    pub stashes: Vec<StashItem>,
+    pub selected_stash_idx: usize,
+    pub stashes_table_state: TableState,
+
+    // Modals & Notifications
+    pub active_modal: Option<ActiveModal>,
+    pub status_message: Option<(String, bool)>, // (message, is_error)
 
     // Diff Viewer
     pub diff_viewer: Option<DiffViewerState>,
@@ -62,6 +105,8 @@ impl App {
 
             current_repo_path: None,
             current_repo_name: String::new(),
+            current_tab: RepoTab::Graph,
+
             graph_rows: Vec::new(),
             selected_commit_idx: 0,
             commit_detail: None,
@@ -70,11 +115,32 @@ impl App {
             graph_table_state: TableState::default(),
             files_table_state: TableState::default(),
 
+            status_section: StatusSection::Unstaged,
+            selected_staged_idx: 0,
+            selected_unstaged_idx: 0,
+            selected_untracked_idx: 0,
+            repo_status: RepoStatus::default(),
+            staged_table_state: TableState::default(),
+            unstaged_table_state: TableState::default(),
+            untracked_table_state: TableState::default(),
+            status_preview_diff: None,
+
+            branches: Vec::new(),
+            selected_branch_idx: 0,
+            branches_table_state: TableState::default(),
+
+            stashes: Vec::new(),
+            selected_stash_idx: 0,
+            stashes_table_state: TableState::default(),
+
+            active_modal: None,
+            status_message: None,
+
             diff_viewer: None,
         }
     }
 
-    /// Polls messages from the background scanner and returns newly discovered repository paths
+    /// Polls messages from background scanner and streams repo records
     pub fn poll_scanner(&mut self) -> Vec<PathBuf> {
         let mut messages = Vec::new();
         if let Some(rx) = &self.scanner_rx {
@@ -121,7 +187,16 @@ impl App {
         self.scanner_rx = Some(rx);
     }
 
+    pub fn set_status_message(&mut self, msg: String, is_error: bool) {
+        self.status_message = Some((msg, is_error));
+    }
+
+    pub fn clear_status_message(&mut self) {
+        self.status_message = None;
+    }
+
     pub fn sync_table_states(&mut self) {
+        // Fleet
         let visible = self.visible_repo_indices();
         if visible.is_empty() {
             self.fleet_table_state.select(None);
@@ -132,6 +207,7 @@ impl App {
             self.fleet_table_state.select(Some(self.selected_repo_v_idx));
         }
 
+        // Tab 1: Graph & files
         if self.graph_rows.is_empty() {
             self.graph_table_state.select(None);
         } else {
@@ -146,6 +222,54 @@ impl App {
             }
         } else {
             self.files_table_state.select(None);
+        }
+
+        // Tab 2: Status sections
+        if self.repo_status.staged.is_empty() {
+            self.staged_table_state.select(None);
+        } else {
+            if self.selected_staged_idx >= self.repo_status.staged.len() {
+                self.selected_staged_idx = self.repo_status.staged.len().saturating_sub(1);
+            }
+            self.staged_table_state.select(Some(self.selected_staged_idx));
+        }
+
+        if self.repo_status.unstaged.is_empty() {
+            self.unstaged_table_state.select(None);
+        } else {
+            if self.selected_unstaged_idx >= self.repo_status.unstaged.len() {
+                self.selected_unstaged_idx = self.repo_status.unstaged.len().saturating_sub(1);
+            }
+            self.unstaged_table_state.select(Some(self.selected_unstaged_idx));
+        }
+
+        if self.repo_status.untracked.is_empty() {
+            self.untracked_table_state.select(None);
+        } else {
+            if self.selected_untracked_idx >= self.repo_status.untracked.len() {
+                self.selected_untracked_idx = self.repo_status.untracked.len().saturating_sub(1);
+            }
+            self.untracked_table_state.select(Some(self.selected_untracked_idx));
+        }
+
+        // Tab 3: Branches
+        if self.branches.is_empty() {
+            self.branches_table_state.select(None);
+        } else {
+            if self.selected_branch_idx >= self.branches.len() {
+                self.selected_branch_idx = self.branches.len().saturating_sub(1);
+            }
+            self.branches_table_state.select(Some(self.selected_branch_idx));
+        }
+
+        // Tab 4: Stashes
+        if self.stashes.is_empty() {
+            self.stashes_table_state.select(None);
+        } else {
+            if self.selected_stash_idx >= self.stashes.len() {
+                self.selected_stash_idx = self.stashes.len().saturating_sub(1);
+            }
+            self.stashes_table_state.select(Some(self.selected_stash_idx));
         }
     }
 
@@ -183,6 +307,659 @@ impl App {
         }
     }
 
+    // -------------------------------------------------------------
+    // Tab Switching & Data Loading
+    // -------------------------------------------------------------
+
+    pub fn set_repo_tab(&mut self, tab: RepoTab) {
+        self.current_tab = tab;
+        match tab {
+            RepoTab::Graph => {
+                // If graph rows are empty, reload them
+                if self.graph_rows.is_empty() {
+                    if let Some(path) = &self.current_repo_path {
+                        if let Ok(rows) = git_engine::load_commit_graph(path, self.max_commits) {
+                            self.graph_rows = rows;
+                            self.on_commit_selection_changed();
+                        }
+                    }
+                }
+            }
+            RepoTab::Status => {
+                self.refresh_repo_status();
+            }
+            RepoTab::Branches => {
+                self.refresh_branches();
+            }
+            RepoTab::Stash => {
+                self.refresh_stashes();
+            }
+        }
+        self.sync_table_states();
+    }
+
+    pub fn next_repo_tab(&mut self) {
+        self.set_repo_tab(self.current_tab.next());
+    }
+
+    pub fn prev_repo_tab(&mut self) {
+        self.set_repo_tab(self.current_tab.prev());
+    }
+
+    pub fn refresh_repo_status(&mut self) {
+        let path = match &self.current_repo_path {
+            Some(p) => p.clone(),
+            None => return,
+        };
+
+        if let Ok(status) = git_actions::load_repo_status(&path) {
+            self.repo_status = status;
+            // Update live preview diff
+            self.update_status_preview_diff();
+            // Also sync dirty state in repos list
+            if let Some(rec) = self.repos.iter_mut().find(|r| r.path == path) {
+                rec.is_dirty = self.repo_status.total_count() > 0;
+                rec.modified_count = self.repo_status.staged.len() + self.repo_status.unstaged.len();
+                rec.untracked_count = self.repo_status.untracked.len();
+            }
+        }
+        self.sync_table_states();
+    }
+
+    pub fn update_status_preview_diff(&mut self) {
+        let path = match &self.current_repo_path {
+            Some(p) => p.clone(),
+            None => return,
+        };
+
+        let current_item = self.current_selected_status_item();
+        match current_item {
+            Some(item) => {
+                let diff_res = match self.status_section {
+                    StatusSection::Staged => {
+                        git_engine::load_working_tree_diff(&path, &item.path, true)
+                    }
+                    StatusSection::Unstaged => {
+                        git_engine::load_working_tree_diff(&path, &item.path, false)
+                    }
+                    StatusSection::Untracked => {
+                        git_engine::load_untracked_diff(&path, &item.path)
+                    }
+                };
+
+                if let Ok((full, diff_only)) = diff_res {
+                    self.status_preview_diff = Some(DiffViewerState::new(
+                        item.path.clone(),
+                        "Working Tree".to_string(),
+                        full,
+                        diff_only,
+                    ));
+                } else {
+                    self.status_preview_diff = None;
+                }
+            }
+            None => {
+                self.status_preview_diff = None;
+            }
+        }
+    }
+
+    pub fn refresh_branches(&mut self) {
+        let path = match &self.current_repo_path {
+            Some(p) => p.clone(),
+            None => return,
+        };
+
+        if let Ok(branches) = git_actions::load_branches(&path) {
+            self.branches = branches;
+            if self.selected_branch_idx >= self.branches.len() {
+                self.selected_branch_idx = self.branches.len().saturating_sub(1);
+            }
+        }
+        self.sync_table_states();
+    }
+
+    pub fn refresh_stashes(&mut self) {
+        let path = match &self.current_repo_path {
+            Some(p) => p.clone(),
+            None => return,
+        };
+
+        if let Ok(stashes) = git_actions::load_stashes(&path) {
+            self.stashes = stashes;
+            if self.selected_stash_idx >= self.stashes.len() {
+                self.selected_stash_idx = self.stashes.len().saturating_sub(1);
+            }
+        }
+        self.sync_table_states();
+    }
+
+    pub fn refresh_all_repo_data(&mut self) {
+        let path = match &self.current_repo_path {
+            Some(p) => p.clone(),
+            None => return,
+        };
+
+        if let Ok(rows) = git_engine::load_commit_graph(&path, self.max_commits) {
+            self.graph_rows = rows;
+            self.on_commit_selection_changed();
+        }
+        self.refresh_repo_status();
+        self.refresh_branches();
+        self.refresh_stashes();
+
+        // Update branch name in record
+        if let Some(branch) = self.branches.iter().find(|b| b.is_current) {
+            if let Some(rec) = self.repos.iter_mut().find(|r| r.path == path) {
+                rec.current_branch = branch.name.clone();
+                rec.ahead = branch.ahead;
+                rec.behind = branch.behind;
+            }
+        }
+
+        self.sync_table_states();
+    }
+
+    pub fn current_selected_status_item(&self) -> Option<StatusFileItem> {
+        match self.status_section {
+            StatusSection::Staged => self.repo_status.staged.get(self.selected_staged_idx).cloned(),
+            StatusSection::Unstaged => self.repo_status.unstaged.get(self.selected_unstaged_idx).cloned(),
+            StatusSection::Untracked => self.repo_status.untracked.get(self.selected_untracked_idx).cloned(),
+        }
+    }
+
+    // -------------------------------------------------------------
+    // Git Client Actions
+    // -------------------------------------------------------------
+
+    pub fn toggle_stage_selected(&mut self) {
+        let path = match &self.current_repo_path {
+            Some(p) => p.clone(),
+            None => return,
+        };
+
+        let item = match self.current_selected_status_item() {
+            Some(it) => it,
+            None => return,
+        };
+
+        match self.status_section {
+            StatusSection::Staged => {
+                if let Err(e) = git_actions::unstage_file(&path, &item.path) {
+                    self.set_status_message(format!("Unstage error: {}", e), true);
+                }
+            }
+            StatusSection::Unstaged | StatusSection::Untracked => {
+                if let Err(e) = git_actions::stage_file(&path, &item.path) {
+                    self.set_status_message(format!("Stage error: {}", e), true);
+                }
+            }
+        }
+
+        self.refresh_repo_status();
+    }
+
+    pub fn stage_all(&mut self) {
+        let path = match &self.current_repo_path {
+            Some(p) => p.clone(),
+            None => return,
+        };
+
+        if let Err(e) = git_actions::stage_all(&path) {
+            self.set_status_message(format!("Stage all error: {}", e), true);
+        } else {
+            self.set_status_message("Staged all changes".to_string(), false);
+        }
+        self.refresh_repo_status();
+    }
+
+    pub fn unstage_all(&mut self) {
+        let path = match &self.current_repo_path {
+            Some(p) => p.clone(),
+            None => return,
+        };
+
+        if let Err(e) = git_actions::unstage_all(&path) {
+            self.set_status_message(format!("Unstage all error: {}", e), true);
+        } else {
+            self.set_status_message("Unstaged all changes".to_string(), false);
+        }
+        self.refresh_repo_status();
+    }
+
+    pub fn open_commit_modal(&mut self, amend: bool) {
+        if self.repo_status.staged.is_empty() && !amend {
+            self.set_status_message("Nothing staged to commit (use Space or 'a' to stage files)".to_string(), true);
+            return;
+        }
+
+        self.active_modal = Some(ActiveModal::Commit {
+            message: String::new(),
+            amend,
+            cursor_pos: 0,
+        });
+    }
+
+    pub fn open_discard_confirm(&mut self) {
+        let item = match self.current_selected_status_item() {
+            Some(it) => it,
+            None => return,
+        };
+
+        let is_untracked = self.status_section == StatusSection::Untracked;
+        let prompt = if is_untracked {
+            format!("Permanently delete untracked file '{}'?", item.path)
+        } else {
+            format!("Discard all uncommitted changes in '{}'?", item.path)
+        };
+
+        self.active_modal = Some(ActiveModal::Confirm {
+            title: "Discard Changes".to_string(),
+            prompt,
+            action: ConfirmAction::DiscardFile {
+                path: item.path,
+                is_untracked,
+            },
+        });
+    }
+
+    pub fn checkout_selected_branch(&mut self) {
+        let path = match &self.current_repo_path {
+            Some(p) => p.clone(),
+            None => return,
+        };
+
+        let branch = match self.branches.get(self.selected_branch_idx) {
+            Some(b) => b,
+            None => return,
+        };
+
+        if branch.is_current {
+            self.set_status_message(format!("Already on branch '{}'", branch.name), false);
+            return;
+        }
+
+        let branch_name = branch.name.clone();
+        match git_actions::checkout_branch(&path, &branch_name) {
+            Ok(msg) => {
+                self.set_status_message(msg, false);
+                self.refresh_all_repo_data();
+            }
+            Err(err) => {
+                self.set_status_message(format!("Checkout failed: {}", err), true);
+            }
+        }
+    }
+
+    pub fn open_new_branch_modal(&mut self) {
+        self.active_modal = Some(ActiveModal::NewBranch {
+            name: String::new(),
+            checkout: true,
+        });
+    }
+
+    pub fn open_delete_branch_confirm(&mut self) {
+        let branch = match self.branches.get(self.selected_branch_idx) {
+            Some(b) => b,
+            None => return,
+        };
+
+        if branch.is_current {
+            self.set_status_message("Cannot delete the currently checked out branch".to_string(), true);
+            return;
+        }
+
+        self.active_modal = Some(ActiveModal::Confirm {
+            title: "Delete Branch".to_string(),
+            prompt: format!("Are you sure you want to delete branch '{}'?", branch.name),
+            action: ConfirmAction::DeleteBranch {
+                name: branch.name.clone(),
+                is_remote: branch.is_remote,
+            },
+        });
+    }
+
+    pub fn open_stash_save_modal(&mut self) {
+        let path = match &self.current_repo_path {
+            Some(p) => p.clone(),
+            None => return,
+        };
+
+        match git_actions::stash_save(&path, None) {
+            Ok(msg) => {
+                self.set_status_message(msg, false);
+                self.refresh_stashes();
+                self.refresh_repo_status();
+            }
+            Err(e) => {
+                self.set_status_message(format!("Stash error: {}", e), true);
+            }
+        }
+    }
+
+    pub fn pop_selected_stash(&mut self) {
+        let path = match &self.current_repo_path {
+            Some(p) => p.clone(),
+            None => return,
+        };
+
+        let stash = match self.stashes.get(self.selected_stash_idx) {
+            Some(s) => s,
+            None => return,
+        };
+
+        match git_actions::stash_pop(&path, stash.index) {
+            Ok(msg) => {
+                self.set_status_message(msg, false);
+                self.refresh_stashes();
+                self.refresh_repo_status();
+            }
+            Err(e) => {
+                self.set_status_message(format!("Stash pop error: {}", e), true);
+            }
+        }
+    }
+
+    pub fn open_drop_stash_confirm(&mut self) {
+        let stash = match self.stashes.get(self.selected_stash_idx) {
+            Some(s) => s,
+            None => return,
+        };
+
+        self.active_modal = Some(ActiveModal::Confirm {
+            title: "Drop Stash".to_string(),
+            prompt: format!("Are you sure you want to drop {} ('{}')?", stash.selector, stash.message),
+            action: ConfirmAction::DropStash {
+                index: stash.index,
+            },
+        });
+    }
+
+    pub fn push_repo(&mut self) {
+        let path = match &self.current_repo_path {
+            Some(p) => p.clone(),
+            None => return,
+        };
+
+        self.set_status_message("Pushing changes to remote...".to_string(), false);
+        match git_actions::push(&path) {
+            Ok(msg) => {
+                self.set_status_message(format!("✓ {}", msg), false);
+                self.refresh_branches();
+            }
+            Err(e) => {
+                self.active_modal = Some(ActiveModal::CommandResult {
+                    title: "Push Failed".to_string(),
+                    output: e,
+                    is_error: true,
+                    scroll: 0,
+                });
+            }
+        }
+    }
+
+    pub fn pull_repo(&mut self) {
+        let path = match &self.current_repo_path {
+            Some(p) => p.clone(),
+            None => return,
+        };
+
+        self.set_status_message("Pulling changes from remote...".to_string(), false);
+        match git_actions::pull(&path) {
+            Ok(msg) => {
+                self.set_status_message(format!("✓ {}", msg), false);
+                self.refresh_all_repo_data();
+            }
+            Err(e) => {
+                self.active_modal = Some(ActiveModal::CommandResult {
+                    title: "Pull Failed".to_string(),
+                    output: e,
+                    is_error: true,
+                    scroll: 0,
+                });
+            }
+        }
+    }
+
+    pub fn fetch_repo(&mut self) {
+        let path = match &self.current_repo_path {
+            Some(p) => p.clone(),
+            None => return,
+        };
+
+        self.set_status_message("Fetching remotes...".to_string(), false);
+        match git_actions::fetch(&path) {
+            Ok(msg) => {
+                self.set_status_message(format!("✓ {}", msg), false);
+                self.refresh_branches();
+            }
+            Err(e) => {
+                self.active_modal = Some(ActiveModal::CommandResult {
+                    title: "Fetch Failed".to_string(),
+                    output: e,
+                    is_error: true,
+                    scroll: 0,
+                });
+            }
+        }
+    }
+
+    pub fn open_help_modal(&mut self) {
+        self.active_modal = Some(ActiveModal::Help);
+    }
+
+    // -------------------------------------------------------------
+    // Modal Key Handling
+    // -------------------------------------------------------------
+
+    pub fn handle_modal_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> ModalEvent {
+        let modal = match &mut self.active_modal {
+            Some(m) => m,
+            None => return ModalEvent::None,
+        };
+
+        match modal {
+            ActiveModal::Commit {
+                message,
+                amend,
+                cursor_pos,
+            } => {
+                if modifiers.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('e') {
+                    if let Some(path) = &self.current_repo_path {
+                        return ModalEvent::LaunchEditor {
+                            repo_path: path.clone(),
+                            initial_msg: message.clone(),
+                        };
+                    }
+                }
+
+                match code {
+                    KeyCode::Esc => {
+                        self.active_modal = None;
+                        ModalEvent::Handled
+                    }
+                    KeyCode::Tab => {
+                        *amend = !*amend;
+                        ModalEvent::Handled
+                    }
+                    KeyCode::Enter => {
+                        let msg = message.clone();
+                        let do_amend = *amend;
+                        let path = self.current_repo_path.clone();
+                        self.active_modal = None;
+
+                        if let Some(repo_path) = path {
+                            match git_actions::commit(&repo_path, &msg, do_amend) {
+                                Ok(res) => {
+                                    self.set_status_message(format!("✓ {}", res), false);
+                                    self.refresh_all_repo_data();
+                                }
+                                Err(err) => {
+                                    self.active_modal = Some(ActiveModal::CommandResult {
+                                        title: "Commit Failed".to_string(),
+                                        output: err,
+                                        is_error: true,
+                                        scroll: 0,
+                                    });
+                                }
+                            }
+                        }
+                        ModalEvent::Handled
+                    }
+                    KeyCode::Left => {
+                        *cursor_pos = cursor_pos.saturating_sub(1);
+                        ModalEvent::Handled
+                    }
+                    KeyCode::Right => {
+                        if *cursor_pos < message.len() {
+                            *cursor_pos += 1;
+                        }
+                        ModalEvent::Handled
+                    }
+                    KeyCode::Backspace => {
+                        if *cursor_pos > 0 && !message.is_empty() {
+                            message.remove(*cursor_pos - 1);
+                            *cursor_pos -= 1;
+                        }
+                        ModalEvent::Handled
+                    }
+                    KeyCode::Char(c) => {
+                        message.insert(*cursor_pos, c);
+                        *cursor_pos += 1;
+                        ModalEvent::Handled
+                    }
+                    _ => ModalEvent::Handled,
+                }
+            }
+            ActiveModal::NewBranch { name, checkout } => match code {
+                KeyCode::Esc => {
+                    self.active_modal = None;
+                    ModalEvent::Handled
+                }
+                KeyCode::Tab => {
+                    *checkout = !*checkout;
+                    ModalEvent::Handled
+                }
+                KeyCode::Enter => {
+                    let branch_name = name.trim().to_string();
+                    let do_checkout = *checkout;
+                    let path = self.current_repo_path.clone();
+                    self.active_modal = None;
+
+                    if branch_name.is_empty() {
+                        self.set_status_message("Branch name cannot be empty".to_string(), true);
+                        return ModalEvent::Handled;
+                    }
+
+                    if let Some(repo_path) = path {
+                        match git_actions::create_branch(&repo_path, &branch_name, do_checkout) {
+                            Ok(res) => {
+                                self.set_status_message(format!("✓ {}", res), false);
+                                self.refresh_all_repo_data();
+                            }
+                            Err(err) => {
+                                self.active_modal = Some(ActiveModal::CommandResult {
+                                    title: "Create Branch Failed".to_string(),
+                                    output: err,
+                                    is_error: true,
+                                    scroll: 0,
+                                });
+                            }
+                        }
+                    }
+                    ModalEvent::Handled
+                }
+                KeyCode::Backspace => {
+                    name.pop();
+                    ModalEvent::Handled
+                }
+                KeyCode::Char(c) => {
+                    name.push(c);
+                    ModalEvent::Handled
+                }
+                _ => ModalEvent::Handled,
+            },
+            ActiveModal::Confirm { action, .. } => match code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    let act = action.clone();
+                    let path = self.current_repo_path.clone();
+                    self.active_modal = None;
+
+                    if let Some(repo_path) = path {
+                        match act {
+                            ConfirmAction::DiscardFile { path: file_path, is_untracked } => {
+                                match git_actions::discard_file(&repo_path, &file_path, is_untracked) {
+                                    Ok(_) => {
+                                        self.set_status_message(format!("Discarded '{}'", file_path), false);
+                                        self.refresh_repo_status();
+                                    }
+                                    Err(e) => {
+                                        self.set_status_message(format!("Discard error: {}", e), true);
+                                    }
+                                }
+                            }
+                            ConfirmAction::DiscardAll => {}
+                            ConfirmAction::DeleteBranch { name, .. } => {
+                                match git_actions::delete_branch(&repo_path, &name, true) {
+                                    Ok(res) => {
+                                        self.set_status_message(format!("✓ {}", res), false);
+                                        self.refresh_branches();
+                                    }
+                                    Err(e) => {
+                                        self.set_status_message(format!("Delete error: {}", e), true);
+                                    }
+                                }
+                            }
+                            ConfirmAction::DropStash { index } => {
+                                match git_actions::stash_drop(&repo_path, index) {
+                                    Ok(res) => {
+                                        self.set_status_message(format!("✓ {}", res), false);
+                                        self.refresh_stashes();
+                                    }
+                                    Err(e) => {
+                                        self.set_status_message(format!("Drop error: {}", e), true);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    ModalEvent::Handled
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    self.active_modal = None;
+                    ModalEvent::Handled
+                }
+                _ => ModalEvent::Handled,
+            },
+            ActiveModal::CommandResult { scroll, .. } => match code {
+                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
+                    self.active_modal = None;
+                    ModalEvent::Handled
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    *scroll = scroll.saturating_sub(1);
+                    ModalEvent::Handled
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    *scroll = scroll.saturating_add(1);
+                    ModalEvent::Handled
+                }
+                _ => ModalEvent::Handled,
+            },
+            ActiveModal::Help => match code {
+                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char('?') => {
+                    self.active_modal = None;
+                    ModalEvent::Handled
+                }
+                _ => ModalEvent::Handled,
+            },
+        }
+    }
+
+    // -------------------------------------------------------------
+    // Navigation Handlers
+    // -------------------------------------------------------------
+
     pub fn move_up(&mut self) {
         match self.active_view {
             ActiveView::FleetOverview => {
@@ -190,16 +967,48 @@ impl App {
                     self.selected_repo_v_idx -= 1;
                 }
             }
-            ActiveView::RepoDetail => {
-                if self.pane_focus_files {
-                    if self.selected_file_idx > 0 {
-                        self.selected_file_idx -= 1;
+            ActiveView::RepoDetail => match self.current_tab {
+                RepoTab::Graph => {
+                    if self.pane_focus_files {
+                        if self.selected_file_idx > 0 {
+                            self.selected_file_idx -= 1;
+                        }
+                    } else if self.selected_commit_idx > 0 {
+                        self.selected_commit_idx -= 1;
+                        self.on_commit_selection_changed();
                     }
-                } else if self.selected_commit_idx > 0 {
-                    self.selected_commit_idx -= 1;
-                    self.on_commit_selection_changed();
                 }
-            }
+                RepoTab::Status => {
+                    match self.status_section {
+                        StatusSection::Staged => {
+                            if self.selected_staged_idx > 0 {
+                                self.selected_staged_idx -= 1;
+                            }
+                        }
+                        StatusSection::Unstaged => {
+                            if self.selected_unstaged_idx > 0 {
+                                self.selected_unstaged_idx -= 1;
+                            }
+                        }
+                        StatusSection::Untracked => {
+                            if self.selected_untracked_idx > 0 {
+                                self.selected_untracked_idx -= 1;
+                            }
+                        }
+                    }
+                    self.update_status_preview_diff();
+                }
+                RepoTab::Branches => {
+                    if self.selected_branch_idx > 0 {
+                        self.selected_branch_idx -= 1;
+                    }
+                }
+                RepoTab::Stash => {
+                    if self.selected_stash_idx > 0 {
+                        self.selected_stash_idx -= 1;
+                    }
+                }
+            },
             ActiveView::DiffViewer => {
                 if let Some(viewer) = &mut self.diff_viewer {
                     viewer.scroll_up(1);
@@ -217,22 +1026,59 @@ impl App {
                     self.selected_repo_v_idx += 1;
                 }
             }
-            ActiveView::RepoDetail => {
-                if self.pane_focus_files {
-                    if let Some(detail) = &self.commit_detail {
-                        let max = detail.files.len().saturating_sub(1);
-                        if self.selected_file_idx < max {
-                            self.selected_file_idx += 1;
+            ActiveView::RepoDetail => match self.current_tab {
+                RepoTab::Graph => {
+                    if self.pane_focus_files {
+                        if let Some(detail) = &self.commit_detail {
+                            let max = detail.files.len().saturating_sub(1);
+                            if self.selected_file_idx < max {
+                                self.selected_file_idx += 1;
+                            }
+                        }
+                    } else {
+                        let max = self.graph_rows.len().saturating_sub(1);
+                        if self.selected_commit_idx < max {
+                            self.selected_commit_idx += 1;
+                            self.on_commit_selection_changed();
                         }
                     }
-                } else {
-                    let max = self.graph_rows.len().saturating_sub(1);
-                    if self.selected_commit_idx < max {
-                        self.selected_commit_idx += 1;
-                        self.on_commit_selection_changed();
+                }
+                RepoTab::Status => {
+                    match self.status_section {
+                        StatusSection::Staged => {
+                            let max = self.repo_status.staged.len().saturating_sub(1);
+                            if self.selected_staged_idx < max {
+                                self.selected_staged_idx += 1;
+                            }
+                        }
+                        StatusSection::Unstaged => {
+                            let max = self.repo_status.unstaged.len().saturating_sub(1);
+                            if self.selected_unstaged_idx < max {
+                                self.selected_unstaged_idx += 1;
+                            }
+                        }
+                        StatusSection::Untracked => {
+                            let max = self.repo_status.untracked.len().saturating_sub(1);
+                            if self.selected_untracked_idx < max {
+                                self.selected_untracked_idx += 1;
+                            }
+                        }
+                    }
+                    self.update_status_preview_diff();
+                }
+                RepoTab::Branches => {
+                    let max = self.branches.len().saturating_sub(1);
+                    if self.selected_branch_idx < max {
+                        self.selected_branch_idx += 1;
                     }
                 }
-            }
+                RepoTab::Stash => {
+                    let max = self.stashes.len().saturating_sub(1);
+                    if self.selected_stash_idx < max {
+                        self.selected_stash_idx += 1;
+                    }
+                }
+            },
             ActiveView::DiffViewer => {
                 if let Some(viewer) = &mut self.diff_viewer {
                     viewer.scroll_down(1);
@@ -247,10 +1093,26 @@ impl App {
             ActiveView::FleetOverview => {
                 self.selected_repo_v_idx = self.selected_repo_v_idx.saturating_sub(10);
             }
-            ActiveView::RepoDetail => {
-                self.selected_commit_idx = self.selected_commit_idx.saturating_sub(10);
-                self.on_commit_selection_changed();
-            }
+            ActiveView::RepoDetail => match self.current_tab {
+                RepoTab::Graph => {
+                    self.selected_commit_idx = self.selected_commit_idx.saturating_sub(10);
+                    self.on_commit_selection_changed();
+                }
+                RepoTab::Status => {
+                    match self.status_section {
+                        StatusSection::Staged => self.selected_staged_idx = self.selected_staged_idx.saturating_sub(10),
+                        StatusSection::Unstaged => self.selected_unstaged_idx = self.selected_unstaged_idx.saturating_sub(10),
+                        StatusSection::Untracked => self.selected_untracked_idx = self.selected_untracked_idx.saturating_sub(10),
+                    }
+                    self.update_status_preview_diff();
+                }
+                RepoTab::Branches => {
+                    self.selected_branch_idx = self.selected_branch_idx.saturating_sub(10);
+                }
+                RepoTab::Stash => {
+                    self.selected_stash_idx = self.selected_stash_idx.saturating_sub(10);
+                }
+            },
             ActiveView::DiffViewer => {
                 if let Some(viewer) = &mut self.diff_viewer {
                     viewer.scroll_up(15);
@@ -266,11 +1128,38 @@ impl App {
                 let max = self.visible_repo_indices().len().saturating_sub(1);
                 self.selected_repo_v_idx = (self.selected_repo_v_idx + 10).min(max);
             }
-            ActiveView::RepoDetail => {
-                let max = self.graph_rows.len().saturating_sub(1);
-                self.selected_commit_idx = (self.selected_commit_idx + 10).min(max);
-                self.on_commit_selection_changed();
-            }
+            ActiveView::RepoDetail => match self.current_tab {
+                RepoTab::Graph => {
+                    let max = self.graph_rows.len().saturating_sub(1);
+                    self.selected_commit_idx = (self.selected_commit_idx + 10).min(max);
+                    self.on_commit_selection_changed();
+                }
+                RepoTab::Status => {
+                    match self.status_section {
+                        StatusSection::Staged => {
+                            let max = self.repo_status.staged.len().saturating_sub(1);
+                            self.selected_staged_idx = (self.selected_staged_idx + 10).min(max);
+                        }
+                        StatusSection::Unstaged => {
+                            let max = self.repo_status.unstaged.len().saturating_sub(1);
+                            self.selected_unstaged_idx = (self.selected_unstaged_idx + 10).min(max);
+                        }
+                        StatusSection::Untracked => {
+                            let max = self.repo_status.untracked.len().saturating_sub(1);
+                            self.selected_untracked_idx = (self.selected_untracked_idx + 10).min(max);
+                        }
+                    }
+                    self.update_status_preview_diff();
+                }
+                RepoTab::Branches => {
+                    let max = self.branches.len().saturating_sub(1);
+                    self.selected_branch_idx = (self.selected_branch_idx + 10).min(max);
+                }
+                RepoTab::Stash => {
+                    let max = self.stashes.len().saturating_sub(1);
+                    self.selected_stash_idx = (self.selected_stash_idx + 10).min(max);
+                }
+            },
             ActiveView::DiffViewer => {
                 if let Some(viewer) = &mut self.diff_viewer {
                     viewer.scroll_down(15);
@@ -283,10 +1172,22 @@ impl App {
     pub fn move_to_top(&mut self) {
         match self.active_view {
             ActiveView::FleetOverview => self.selected_repo_v_idx = 0,
-            ActiveView::RepoDetail => {
-                self.selected_commit_idx = 0;
-                self.on_commit_selection_changed();
-            }
+            ActiveView::RepoDetail => match self.current_tab {
+                RepoTab::Graph => {
+                    self.selected_commit_idx = 0;
+                    self.on_commit_selection_changed();
+                }
+                RepoTab::Status => {
+                    match self.status_section {
+                        StatusSection::Staged => self.selected_staged_idx = 0,
+                        StatusSection::Unstaged => self.selected_unstaged_idx = 0,
+                        StatusSection::Untracked => self.selected_untracked_idx = 0,
+                    }
+                    self.update_status_preview_diff();
+                }
+                RepoTab::Branches => self.selected_branch_idx = 0,
+                RepoTab::Stash => self.selected_stash_idx = 0,
+            },
             ActiveView::DiffViewer => {
                 if let Some(viewer) = &mut self.diff_viewer {
                     viewer.scroll_to_top();
@@ -301,10 +1202,26 @@ impl App {
             ActiveView::FleetOverview => {
                 self.selected_repo_v_idx = self.visible_repo_indices().len().saturating_sub(1);
             }
-            ActiveView::RepoDetail => {
-                self.selected_commit_idx = self.graph_rows.len().saturating_sub(1);
-                self.on_commit_selection_changed();
-            }
+            ActiveView::RepoDetail => match self.current_tab {
+                RepoTab::Graph => {
+                    self.selected_commit_idx = self.graph_rows.len().saturating_sub(1);
+                    self.on_commit_selection_changed();
+                }
+                RepoTab::Status => {
+                    match self.status_section {
+                        StatusSection::Staged => self.selected_staged_idx = self.repo_status.staged.len().saturating_sub(1),
+                        StatusSection::Unstaged => self.selected_unstaged_idx = self.repo_status.unstaged.len().saturating_sub(1),
+                        StatusSection::Untracked => self.selected_untracked_idx = self.repo_status.untracked.len().saturating_sub(1),
+                    }
+                    self.update_status_preview_diff();
+                }
+                RepoTab::Branches => {
+                    self.selected_branch_idx = self.branches.len().saturating_sub(1);
+                }
+                RepoTab::Stash => {
+                    self.selected_stash_idx = self.stashes.len().saturating_sub(1);
+                }
+            },
             ActiveView::DiffViewer => {
                 if let Some(viewer) = &mut self.diff_viewer {
                     viewer.scroll_to_bottom();
@@ -318,52 +1235,129 @@ impl App {
         match self.active_view {
             ActiveView::FleetOverview => {
                 if let Some(idx) = self.current_selected_repo_idx() {
-                    let repo = &self.repos[idx];
-                    self.current_repo_path = Some(repo.path.clone());
-                    self.current_repo_name = repo.name.clone();
+                    let (repo_path, repo_name) = {
+                        let repo = &self.repos[idx];
+                        (repo.path.clone(), repo.name.clone())
+                    };
+                    self.current_repo_path = Some(repo_path.clone());
+                    self.current_repo_name = repo_name;
 
-                    if let Ok(rows) = git_engine::load_commit_graph(&repo.path, self.max_commits) {
+                    // ALWAYS start on Tab 1: Log & Graph (primary monitoring tool behavior)
+                    self.current_tab = RepoTab::Graph;
+
+                    if let Ok(rows) = git_engine::load_commit_graph(&repo_path, self.max_commits) {
                         self.graph_rows = rows;
                         self.selected_commit_idx = 0;
                         self.pane_focus_files = false;
                         self.selected_file_idx = 0;
                         self.on_commit_selection_changed();
-                        self.sync_table_states();
-                        self.active_view = ActiveView::RepoDetail;
+                    }
+
+                    // Preload status & branches in background
+                    let _ = git_actions::load_repo_status(&repo_path).map(|st| self.repo_status = st);
+                    let _ = git_actions::load_branches(&repo_path).map(|br| self.branches = br);
+
+                    self.sync_table_states();
+                    self.active_view = ActiveView::RepoDetail;
+                }
+            }
+            ActiveView::RepoDetail => match self.current_tab {
+                RepoTab::Graph => {
+                    let repo_path = match &self.current_repo_path {
+                        Some(p) => p.clone(),
+                        None => return,
+                    };
+
+                    let active_commit_hash = self.current_selected_commit_hash();
+                    if active_commit_hash.is_empty() {
+                        return;
+                    }
+
+                    let target_file = if self.pane_focus_files {
+                        self.commit_detail
+                            .as_ref()
+                            .and_then(|d| d.files.get(self.selected_file_idx).map(|f| f.path.clone()))
+                    } else {
+                        None
+                    };
+
+                    let title = target_file.clone().unwrap_or_else(|| "All Changes in Commit".to_string());
+
+                    if let Ok((full, diff_only)) = git_engine::load_commit_diff(&repo_path, &active_commit_hash, target_file.as_deref()) {
+                        self.diff_viewer = Some(DiffViewerState::new(
+                            title,
+                            active_commit_hash.clone(),
+                            full,
+                            diff_only,
+                        ).with_source(DiffSource::Commit { hash: active_commit_hash, file: target_file }));
+                        self.active_view = ActiveView::DiffViewer;
                     }
                 }
-            }
-            ActiveView::RepoDetail => {
-                let repo_path = match &self.current_repo_path {
-                    Some(p) => p.clone(),
-                    None => return,
-                };
+                RepoTab::Status => {
+                    let repo_path = match &self.current_repo_path {
+                        Some(p) => p.clone(),
+                        None => return,
+                    };
 
-                let active_commit_hash = self.current_selected_commit_hash();
-                if active_commit_hash.is_empty() {
-                    return;
+                    let item = match self.current_selected_status_item() {
+                        Some(it) => it,
+                        None => return,
+                    };
+
+                    let diff_res = match self.status_section {
+                        StatusSection::Staged => git_engine::load_working_tree_diff(&repo_path, &item.path, true),
+                        StatusSection::Unstaged => git_engine::load_working_tree_diff(&repo_path, &item.path, false),
+                        StatusSection::Untracked => git_engine::load_untracked_diff(&repo_path, &item.path),
+                    };
+
+                    if let Ok((full, diff_only)) = diff_res {
+                        let is_staged = self.status_section == StatusSection::Staged;
+                        let src = if self.status_section == StatusSection::Untracked {
+                            DiffSource::Untracked { file: item.path.clone() }
+                        } else {
+                            DiffSource::WorkingTree { file: item.path.clone(), staged: is_staged }
+                        };
+
+                        let mode_desc = match self.status_section {
+                            StatusSection::Staged => "Staged (Index vs HEAD)",
+                            StatusSection::Unstaged => "Unstaged (Working Tree vs Index)",
+                            StatusSection::Untracked => "Untracked File",
+                        };
+
+                        self.diff_viewer = Some(DiffViewerState::new(
+                            item.path.clone(),
+                            mode_desc.to_string(),
+                            full,
+                            diff_only,
+                        ).with_source(src));
+                        self.active_view = ActiveView::DiffViewer;
+                    }
                 }
-
-                let target_file = if self.pane_focus_files {
-                    self.commit_detail
-                        .as_ref()
-                        .and_then(|d| d.files.get(self.selected_file_idx).map(|f| f.path.clone()))
-                } else {
-                    None
-                };
-
-                let title = target_file.clone().unwrap_or_else(|| "All Changes in Commit".to_string());
-
-                if let Ok((full, diff_only)) = git_engine::load_commit_diff(&repo_path, &active_commit_hash, target_file.as_deref()) {
-                    self.diff_viewer = Some(DiffViewerState::new(
-                        title,
-                        active_commit_hash,
-                        full,
-                        diff_only,
-                    ));
-                    self.active_view = ActiveView::DiffViewer;
+                RepoTab::Branches => {
+                    self.checkout_selected_branch();
                 }
-            }
+                RepoTab::Stash => {
+                    let repo_path = match &self.current_repo_path {
+                        Some(p) => p.clone(),
+                        None => return,
+                    };
+
+                    let stash = match self.stashes.get(self.selected_stash_idx) {
+                        Some(s) => s,
+                        None => return,
+                    };
+
+                    if let Ok((full, diff_only)) = git_engine::load_stash_diff(&repo_path, &stash.selector) {
+                        self.diff_viewer = Some(DiffViewerState::new(
+                            format!("Stash: {}", stash.message),
+                            stash.selector.clone(),
+                            full,
+                            diff_only,
+                        ).with_source(DiffSource::Stash { selector: stash.selector.clone() }));
+                        self.active_view = ActiveView::DiffViewer;
+                    }
+                }
+            },
             ActiveView::DiffViewer => {
                 self.active_view = ActiveView::RepoDetail;
                 self.diff_viewer = None;
@@ -372,6 +1366,11 @@ impl App {
     }
 
     pub fn on_esc(&mut self) {
+        if self.active_modal.is_some() {
+            self.active_modal = None;
+            return;
+        }
+
         if self.is_filtering {
             self.is_filtering = false;
             self.filter_query.clear();
@@ -389,6 +1388,7 @@ impl App {
                 self.graph_rows.clear();
                 self.commit_detail = None;
                 self.current_repo_path = None;
+                self.status_preview_diff = None;
                 self.sync_table_states();
             }
             ActiveView::FleetOverview => {}
@@ -397,9 +1397,16 @@ impl App {
 
     pub fn switch_pane(&mut self) {
         match self.active_view {
-            ActiveView::RepoDetail => {
-                self.pane_focus_files = !self.pane_focus_files;
-            }
+            ActiveView::RepoDetail => match self.current_tab {
+                RepoTab::Graph => {
+                    self.pane_focus_files = !self.pane_focus_files;
+                }
+                RepoTab::Status => {
+                    self.status_section = self.status_section.next();
+                    self.update_status_preview_diff();
+                }
+                _ => {}
+            },
             ActiveView::DiffViewer => {
                 if let Some(viewer) = &mut self.diff_viewer {
                     viewer.toggle_mode();
@@ -468,35 +1475,14 @@ mod tests {
 
     #[test]
     fn test_filter_repos() {
-        let mut app = App {
-            root_path: PathBuf::from("."),
-            max_commits: 200,
-            max_depth: 5,
-            active_view: ActiveView::FleetOverview,
-            repos: vec![
-                create_test_repo("filetop", "main", "feat: viewer"),
-                create_test_repo("control", "dev", "fix: logic"),
-                create_test_repo("gitop", "feat/init", "init project"),
-            ],
-            selected_repo_v_idx: 0,
-            filter_query: String::new(),
-            is_filtering: false,
-            fleet_table_state: TableState::default(),
-            is_scanning: false,
-            scan_spinner_frame: 0,
-            scanner_rx: None,
-            total_scanned: 3,
-            current_repo_path: None,
-            current_repo_name: String::new(),
-            graph_rows: Vec::new(),
-            selected_commit_idx: 0,
-            commit_detail: None,
-            pane_focus_files: false,
-            selected_file_idx: 0,
-            graph_table_state: TableState::default(),
-            files_table_state: TableState::default(),
-            diff_viewer: None,
-        };
+        let mut app = App::new(PathBuf::from("."), 200, 5);
+        app.is_scanning = false;
+        app.scanner_rx = None;
+        app.repos = vec![
+            create_test_repo("filetop", "main", "feat: viewer"),
+            create_test_repo("control", "dev", "fix: logic"),
+            create_test_repo("gitop", "feat/init", "init project"),
+        ];
 
         assert_eq!(app.visible_repo_indices().len(), 3);
 
@@ -516,34 +1502,13 @@ mod tests {
 
     #[test]
     fn test_navigation_bounds() {
-        let mut app = App {
-            root_path: PathBuf::from("."),
-            max_commits: 200,
-            max_depth: 5,
-            active_view: ActiveView::FleetOverview,
-            repos: vec![
-                create_test_repo("repo1", "main", "msg"),
-                create_test_repo("repo2", "main", "msg"),
-            ],
-            selected_repo_v_idx: 0,
-            filter_query: String::new(),
-            is_filtering: false,
-            fleet_table_state: TableState::default(),
-            is_scanning: false,
-            scan_spinner_frame: 0,
-            scanner_rx: None,
-            total_scanned: 2,
-            current_repo_path: None,
-            current_repo_name: String::new(),
-            graph_rows: Vec::new(),
-            selected_commit_idx: 0,
-            commit_detail: None,
-            pane_focus_files: false,
-            selected_file_idx: 0,
-            graph_table_state: TableState::default(),
-            files_table_state: TableState::default(),
-            diff_viewer: None,
-        };
+        let mut app = App::new(PathBuf::from("."), 200, 5);
+        app.is_scanning = false;
+        app.scanner_rx = None;
+        app.repos = vec![
+            create_test_repo("repo1", "main", "msg"),
+            create_test_repo("repo2", "main", "msg"),
+        ];
 
         app.move_up();
         assert_eq!(app.selected_repo_v_idx, 0);
@@ -559,5 +1524,63 @@ mod tests {
 
         app.move_to_bottom();
         assert_eq!(app.selected_repo_v_idx, 1);
+    }
+
+    #[test]
+    fn test_tab_switching() {
+        let mut app = App::new(PathBuf::from("."), 200, 5);
+        app.active_view = ActiveView::RepoDetail;
+        assert_eq!(app.current_tab, RepoTab::Graph);
+
+        app.next_repo_tab();
+        assert_eq!(app.current_tab, RepoTab::Status);
+
+        app.next_repo_tab();
+        assert_eq!(app.current_tab, RepoTab::Branches);
+
+        app.next_repo_tab();
+        assert_eq!(app.current_tab, RepoTab::Stash);
+
+        app.next_repo_tab();
+        assert_eq!(app.current_tab, RepoTab::Graph);
+
+        app.prev_repo_tab();
+        assert_eq!(app.current_tab, RepoTab::Stash);
+    }
+
+    #[test]
+    fn test_modal_commit_typing() {
+        let mut app = App::new(PathBuf::from("."), 200, 5);
+        app.active_modal = Some(ActiveModal::Commit {
+            message: "feat: init".to_string(),
+            amend: false,
+            cursor_pos: 10,
+        });
+
+        // Type '!'
+        app.handle_modal_key(KeyCode::Char('!'), KeyModifiers::NONE);
+        if let Some(ActiveModal::Commit { message, cursor_pos, .. }) = &app.active_modal {
+            assert_eq!(message, "feat: init!");
+            assert_eq!(*cursor_pos, 11);
+        } else {
+            panic!("Expected commit modal");
+        }
+
+        // Backspace
+        app.handle_modal_key(KeyCode::Backspace, KeyModifiers::NONE);
+        if let Some(ActiveModal::Commit { message, cursor_pos, .. }) = &app.active_modal {
+            assert_eq!(message, "feat: init");
+            assert_eq!(*cursor_pos, 10);
+        } else {
+            panic!("Expected commit modal");
+        }
+
+        // Toggle amend
+        app.handle_modal_key(KeyCode::Tab, KeyModifiers::NONE);
+        if let Some(ActiveModal::Commit { amend, .. }) = &app.active_modal {
+            assert!(*amend);
+        } else {
+            panic!("Expected commit modal");
+        }
     }
 }

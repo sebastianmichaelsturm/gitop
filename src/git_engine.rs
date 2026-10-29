@@ -452,28 +452,8 @@ pub fn load_commit_details(
     })
 }
 
-/// Loads diff for a commit (optionally limited to a specific file)
-pub fn load_commit_diff(
-    repo_path: &Path,
-    commit_hash: &str,
-    file: Option<&str>,
-) -> Result<(Vec<DiffLine>, Vec<DiffLine>), Box<dyn std::error::Error>> {
-    let mut cmd = Command::new("git");
-    cmd.args([
-        "-C",
-        &repo_path.to_string_lossy(),
-        "show",
-        "--color=never",
-        commit_hash,
-    ]);
-
-    if let Some(f) = file {
-        cmd.arg("--").arg(f);
-    }
-
-    let output = cmd.output()?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
+/// Parses git diff output into full lines and diff-only lines
+pub fn parse_diff_output(stdout: &str) -> (Vec<DiffLine>, Vec<DiffLine>) {
     let mut full_lines = Vec::new();
     let mut diff_only_lines = Vec::new();
     let mut line_counter = 1;
@@ -526,7 +506,115 @@ pub fn load_commit_diff(
         }
     }
 
+    (full_lines, diff_only_lines)
+}
+
+/// Loads diff for a commit (optionally limited to a specific file)
+pub fn load_commit_diff(
+    repo_path: &Path,
+    commit_hash: &str,
+    file: Option<&str>,
+) -> Result<(Vec<DiffLine>, Vec<DiffLine>), Box<dyn std::error::Error>> {
+    let mut cmd = Command::new("git");
+    cmd.args([
+        "-C",
+        &repo_path.to_string_lossy(),
+        "show",
+        "--color=never",
+        commit_hash,
+    ]);
+
+    if let Some(f) = file {
+        cmd.arg("--").arg(f);
+    }
+
+    let output = cmd.output()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(parse_diff_output(&stdout))
+}
+
+/// Loads working tree diff (staged or unstaged) for a file
+pub fn load_working_tree_diff(
+    repo_path: &Path,
+    file: &str,
+    staged: bool,
+) -> Result<(Vec<DiffLine>, Vec<DiffLine>), Box<dyn std::error::Error>> {
+    let mut cmd = Command::new("git");
+    cmd.args([
+        "-C",
+        &repo_path.to_string_lossy(),
+        "diff",
+        "--color=never",
+    ]);
+
+    if staged {
+        cmd.arg("--cached");
+    }
+
+    cmd.arg("--").arg(file);
+
+    let output = cmd.output()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(parse_diff_output(&stdout))
+}
+
+/// Loads diff for an untracked file (shows entire file as additions)
+pub fn load_untracked_diff(
+    repo_path: &Path,
+    file: &str,
+) -> Result<(Vec<DiffLine>, Vec<DiffLine>), Box<dyn std::error::Error>> {
+    let full_path = repo_path.join(file);
+    let content = match std::fs::read_to_string(&full_path) {
+        Ok(c) => c,
+        Err(_) => "(binary or inaccessible file)".to_string(),
+    };
+
+    let mut full_lines = Vec::new();
+    let mut diff_only_lines = Vec::new();
+
+    full_lines.push(DiffLine {
+        kind: DiffLineKind::Info,
+        content: format!("--- /dev/null (untracked)"),
+        line_number: None,
+    });
+    full_lines.push(DiffLine {
+        kind: DiffLineKind::Info,
+        content: format!("+++ b/{}", file),
+        line_number: None,
+    });
+
+    for (idx, line) in content.lines().enumerate() {
+        let dl = DiffLine {
+            kind: DiffLineKind::Addition,
+            content: format!("+{}", line),
+            line_number: Some(idx + 1),
+        };
+        full_lines.push(dl.clone());
+        diff_only_lines.push(dl);
+    }
+
     Ok((full_lines, diff_only_lines))
+}
+
+/// Loads diff for a stash
+pub fn load_stash_diff(
+    repo_path: &Path,
+    selector: &str,
+) -> Result<(Vec<DiffLine>, Vec<DiffLine>), Box<dyn std::error::Error>> {
+    let output = Command::new("git")
+        .args([
+            "-C",
+            &repo_path.to_string_lossy(),
+            "stash",
+            "show",
+            "-p",
+            "--color=never",
+            selector,
+        ])
+        .output()?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(parse_diff_output(&stdout))
 }
 
 #[cfg(test)]

@@ -1,5 +1,5 @@
 use crate::model::{
-    BranchItem, FileChangeKind, RepoStatus, StashItem, StatusFileItem,
+    BranchItem, FileChangeKind, MergeStrategy, RepoOpState, RepoStatus, StashItem, StatusFileItem,
 };
 use std::fs;
 use std::path::Path;
@@ -551,6 +551,111 @@ pub fn fetch(repo: &Path) -> Result<String, String> {
     }
 }
 
+pub fn merge(repo: &Path, target: &str, strategy: MergeStrategy) -> Result<String, String> {
+    let mut cmd = Command::new("git");
+    cmd.args(["-C", &repo.to_string_lossy(), "merge"]);
+
+    match strategy {
+        MergeStrategy::Default => {}
+        MergeStrategy::NoFastForward => {
+            cmd.arg("--no-ff");
+        }
+        MergeStrategy::FastForwardOnly => {
+            cmd.arg("--ff-only");
+        }
+    }
+
+    cmd.arg(target);
+
+    let output = cmd.output().map_err(|e| format!("Failed to execute git merge: {}", e))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+
+    if output.status.success() {
+        let msg = if stdout.is_empty() { stderr } else { stdout };
+        Ok(if msg.is_empty() { format!("Merged '{}' successfully", target) } else { msg })
+    } else {
+        let err = if stderr.is_empty() { stdout } else { stderr };
+        Err(err)
+    }
+}
+
+pub fn merge_abort(repo: &Path) -> Result<String, String> {
+    let output = Command::new("git")
+        .args(["-C", &repo.to_string_lossy(), "merge", "--abort"])
+        .output()
+        .map_err(|e| format!("Failed to abort merge: {}", e))?;
+
+    if output.status.success() {
+        Ok("Merge aborted successfully".to_string())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
+pub fn rebase(repo: &Path, target: &str, autostash: bool) -> Result<String, String> {
+    let mut cmd = Command::new("git");
+    cmd.args(["-C", &repo.to_string_lossy(), "rebase"]);
+
+    if autostash {
+        cmd.arg("--autostash");
+    }
+
+    cmd.arg(target);
+
+    let output = cmd.output().map_err(|e| format!("Failed to execute git rebase: {}", e))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+
+    if output.status.success() {
+        let msg = if stdout.is_empty() { stderr } else { stdout };
+        Ok(if msg.is_empty() { format!("Rebased onto '{}' successfully", target) } else { msg })
+    } else {
+        let err = if stderr.is_empty() { stdout } else { stderr };
+        Err(err)
+    }
+}
+
+pub fn rebase_abort(repo: &Path) -> Result<String, String> {
+    let output = Command::new("git")
+        .args(["-C", &repo.to_string_lossy(), "rebase", "--abort"])
+        .output()
+        .map_err(|e| format!("Failed to abort rebase: {}", e))?;
+
+    if output.status.success() {
+        Ok("Rebase aborted successfully".to_string())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
+pub fn rebase_continue(repo: &Path) -> Result<String, String> {
+    let output = Command::new("git")
+        .args(["-C", &repo.to_string_lossy(), "rebase", "--continue"])
+        .output()
+        .map_err(|e| format!("Failed to continue rebase: {}", e))?;
+
+    if output.status.success() {
+        let msg = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        Ok(if msg.is_empty() { "Rebase continued".to_string() } else { msg })
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
+pub fn check_repo_op_state(repo: &Path) -> RepoOpState {
+    let git_dir = repo.join(".git");
+    if git_dir.join("MERGE_HEAD").exists() {
+        RepoOpState::Merging
+    } else if git_dir.join("rebase-merge").exists() || git_dir.join("rebase-apply").exists() {
+        RepoOpState::Rebasing
+    } else {
+        RepoOpState::Normal
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -687,6 +792,81 @@ mod tests {
         stash_pop(&temp_dir, 0).unwrap();
         let status = load_repo_status(&temp_dir).unwrap();
         assert_eq!(status.unstaged.len(), 1);
+
+        // Clean up
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_merge_strategy_cycle() {
+        let s = MergeStrategy::Default;
+        assert_eq!(s.next(), MergeStrategy::NoFastForward);
+        assert_eq!(s.next().next(), MergeStrategy::FastForwardOnly);
+        assert_eq!(s.next().next().next(), MergeStrategy::Default);
+    }
+
+    #[test]
+    fn test_merge_and_rebase_operations() {
+        let temp_dir = std::env::temp_dir().join(format!("gitop_test_merge_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let _ = Command::new("git").args(["init", "-b", "main"]).current_dir(&temp_dir).output();
+        let _ = Command::new("git").args(["config", "user.name", "Test"]).current_dir(&temp_dir).output();
+        let _ = Command::new("git").args(["config", "user.email", "test@test.com"]).current_dir(&temp_dir).output();
+
+        assert_eq!(check_repo_op_state(&temp_dir), RepoOpState::Normal);
+
+        // Commit on main
+        fs::write(temp_dir.join("file1.txt"), "hello main\n").unwrap();
+        stage_all(&temp_dir).unwrap();
+        commit(&temp_dir, "initial on main", false).unwrap();
+
+        // Branch feature-a
+        create_branch(&temp_dir, "feature-a", true).unwrap();
+        fs::write(temp_dir.join("file_a.txt"), "hello feature a\n").unwrap();
+        stage_all(&temp_dir).unwrap();
+        commit(&temp_dir, "commit on feature a", false).unwrap();
+
+        // Back to main and merge feature-a
+        checkout_branch(&temp_dir, "main").unwrap();
+        let merge_res = merge(&temp_dir, "feature-a", MergeStrategy::Default).unwrap();
+        assert!(merge_res.contains("Merged") || merge_res.contains("Fast-forward"));
+        assert!(temp_dir.join("file_a.txt").exists());
+        assert_eq!(check_repo_op_state(&temp_dir), RepoOpState::Normal);
+
+        // Branch feature-b off main
+        create_branch(&temp_dir, "feature-b", true).unwrap();
+        fs::write(temp_dir.join("conflict.txt"), "line from feature b\n").unwrap();
+        stage_all(&temp_dir).unwrap();
+        commit(&temp_dir, "commit on feature b", false).unwrap();
+
+        // Back to main and create conflicting commit
+        checkout_branch(&temp_dir, "main").unwrap();
+        fs::write(temp_dir.join("conflict.txt"), "line from main conflict\n").unwrap();
+        stage_all(&temp_dir).unwrap();
+        commit(&temp_dir, "commit on main conflicting", false).unwrap();
+
+        // Attempt merge feature-b into main -> triggers conflict!
+        let conflict_merge = merge(&temp_dir, "feature-b", MergeStrategy::Default);
+        assert!(conflict_merge.is_err());
+        assert_eq!(check_repo_op_state(&temp_dir), RepoOpState::Merging);
+
+        // Abort merge
+        let abort_res = merge_abort(&temp_dir).unwrap();
+        assert!(abort_res.contains("aborted") || abort_res.contains("Merge aborted"));
+        assert_eq!(check_repo_op_state(&temp_dir), RepoOpState::Normal);
+
+        // Switch to feature-b and rebase onto main -> triggers rebase conflict!
+        checkout_branch(&temp_dir, "feature-b").unwrap();
+        let conflict_rebase = rebase(&temp_dir, "main", false);
+        assert!(conflict_rebase.is_err());
+        assert_eq!(check_repo_op_state(&temp_dir), RepoOpState::Rebasing);
+
+        // Abort rebase
+        let abort_rebase_res = rebase_abort(&temp_dir).unwrap();
+        assert!(abort_rebase_res.contains("aborted") || abort_rebase_res.contains("Rebase aborted"));
+        assert_eq!(check_repo_op_state(&temp_dir), RepoOpState::Normal);
 
         // Clean up
         let _ = fs::remove_dir_all(&temp_dir);

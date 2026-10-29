@@ -288,6 +288,44 @@ pub enum ConfirmAction {
     DropStash { index: usize },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeRebaseOp {
+    Merge,
+    Rebase,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeStrategy {
+    Default,
+    NoFastForward,
+    FastForwardOnly,
+}
+
+impl MergeStrategy {
+    pub fn next(&self) -> Self {
+        match self {
+            MergeStrategy::Default => MergeStrategy::NoFastForward,
+            MergeStrategy::NoFastForward => MergeStrategy::FastForwardOnly,
+            MergeStrategy::FastForwardOnly => MergeStrategy::Default,
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            MergeStrategy::Default => "Default (fast-forward if possible)",
+            MergeStrategy::NoFastForward => "--no-ff (always create merge commit)",
+            MergeStrategy::FastForwardOnly => "--ff-only (refuse if merge commit needed)",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepoOpState {
+    Normal,
+    Merging,
+    Rebasing,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActiveModal {
     Commit {
@@ -303,6 +341,14 @@ pub enum ActiveModal {
         title: String,
         prompt: String,
         action: ConfirmAction,
+    },
+    MergeRebase {
+        op: MergeRebaseOp,
+        current_branch: String,
+        candidate_branches: Vec<String>,
+        selected_branch_idx: usize,
+        strategy: MergeStrategy,
+        autostash: bool,
     },
     Help,
     CommandResult {

@@ -2,8 +2,8 @@ use crate::git_actions;
 use crate::git_engine::{self, ScannerMessage};
 use crate::model::{
     ActiveModal, ActiveView, BranchItem, CommitDetail, CommitGraphRow, ConfirmAction,
-    DiffSource, DiffViewerState, RepoRecord, RepoStatus, RepoTab, StashItem, StatusFileItem,
-    StatusSection,
+    DiffSource, DiffViewerState, MergeRebaseOp, MergeStrategy, RefKind, RepoOpState, RepoRecord, RepoStatus,
+    RepoTab, StashItem, StatusFileItem, StatusSection,
 };
 use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::widgets::TableState;
@@ -76,6 +76,7 @@ pub struct App {
     // Modals & Notifications
     pub active_modal: Option<ActiveModal>,
     pub status_message: Option<(String, bool)>, // (message, is_error)
+    pub repo_op_state: RepoOpState,
 
     // Diff Viewer
     pub diff_viewer: Option<DiffViewerState>,
@@ -135,6 +136,7 @@ impl App {
 
             active_modal: None,
             status_message: None,
+            repo_op_state: RepoOpState::Normal,
 
             diff_viewer: None,
         }
@@ -352,6 +354,8 @@ impl App {
             None => return,
         };
 
+        self.repo_op_state = git_actions::check_repo_op_state(&path);
+
         if let Ok(status) = git_actions::load_repo_status(&path) {
             self.repo_status = status;
             // Update live preview diff
@@ -439,6 +443,8 @@ impl App {
             Some(p) => p.clone(),
             None => return,
         };
+
+        self.repo_op_state = git_actions::check_repo_op_state(&path);
 
         if let Ok(rows) = git_engine::load_commit_graph(&path, self.max_commits) {
             self.graph_rows = rows;
@@ -744,6 +750,161 @@ impl App {
         }
     }
 
+    pub fn open_merge_modal(&mut self) {
+        if self.repo_op_state != RepoOpState::Normal {
+            self.set_status_message("Repository is already in merge/rebase state (press 'A' to abort)".to_string(), true);
+            return;
+        }
+        self.open_merge_rebase_modal(MergeRebaseOp::Merge);
+    }
+
+    pub fn open_rebase_modal(&mut self) {
+        if self.repo_op_state != RepoOpState::Normal {
+            self.set_status_message("Repository is already in merge/rebase state (press 'A' to abort)".to_string(), true);
+            return;
+        }
+        self.open_merge_rebase_modal(MergeRebaseOp::Rebase);
+    }
+
+    pub fn open_merge_rebase_modal(&mut self, op: MergeRebaseOp) {
+        let path = match &self.current_repo_path {
+            Some(p) => p.clone(),
+            None => return,
+        };
+
+        // Ensure branches are loaded
+        if self.branches.is_empty() {
+            if let Ok(branches) = git_actions::load_branches(&path) {
+                self.branches = branches;
+            }
+        }
+
+        let current_branch = self
+            .branches
+            .iter()
+            .find(|b| b.is_current)
+            .map(|b| b.name.clone())
+            .unwrap_or_else(|| "HEAD".to_string());
+
+        // Candidates: all other branches
+        let candidate_branches: Vec<String> = self
+            .branches
+            .iter()
+            .filter(|b| !b.is_current)
+            .map(|b| b.name.clone())
+            .collect();
+
+        if candidate_branches.is_empty() {
+            self.set_status_message("No other branches found to merge/rebase".to_string(), true);
+            return;
+        }
+
+        // Try to pre-select target branch from currently highlighted commit in Graph view
+        let mut preselect_target: Option<String> = None;
+        if self.current_tab == RepoTab::Graph {
+            if let Some(row) = self.graph_rows.get(self.selected_commit_idx) {
+                for r in &row.parsed_refs {
+                    let b_name = match &r.kind {
+                        RefKind::Mainline(name) | RefKind::LocalBranch(name) => Some(name.clone()),
+                        RefKind::RemoteBranch(name) => Some(name.clone()),
+                        _ => None,
+                    };
+                    if let Some(name) = b_name {
+                        if name != current_branch && candidate_branches.contains(&name) {
+                            preselect_target = Some(name);
+                            break;
+                        }
+                    }
+                }
+            }
+        } else if self.current_tab == RepoTab::Branches {
+            if let Some(branch) = self.branches.get(self.selected_branch_idx) {
+                if !branch.is_current && candidate_branches.contains(&branch.name) {
+                    preselect_target = Some(branch.name.clone());
+                }
+            }
+        }
+
+        let selected_branch_idx = if let Some(target) = preselect_target {
+            candidate_branches.iter().position(|b| b == &target).unwrap_or(0)
+        } else {
+            // Default to 'main' or 'master' if present
+            candidate_branches
+                .iter()
+                .position(|b| b == "main" || b == "master" || b == "origin/main" || b == "origin/master")
+                .unwrap_or(0)
+        };
+
+        self.active_modal = Some(ActiveModal::MergeRebase {
+            op,
+            current_branch,
+            candidate_branches,
+            selected_branch_idx,
+            strategy: MergeStrategy::Default,
+            autostash: true,
+        });
+    }
+
+    pub fn abort_current_op(&mut self) {
+        let path = match &self.current_repo_path {
+            Some(p) => p.clone(),
+            None => return,
+        };
+
+        match self.repo_op_state {
+            RepoOpState::Merging => {
+                match git_actions::merge_abort(&path) {
+                    Ok(msg) => {
+                        self.set_status_message(format!("✓ {}", msg), false);
+                        self.refresh_all_repo_data();
+                    }
+                    Err(e) => {
+                        self.set_status_message(format!("Merge abort error: {}", e), true);
+                    }
+                }
+            }
+            RepoOpState::Rebasing => {
+                match git_actions::rebase_abort(&path) {
+                    Ok(msg) => {
+                        self.set_status_message(format!("✓ {}", msg), false);
+                        self.refresh_all_repo_data();
+                    }
+                    Err(e) => {
+                        self.set_status_message(format!("Rebase abort error: {}", e), true);
+                    }
+                }
+            }
+            RepoOpState::Normal => {
+                self.set_status_message("No merge or rebase currently in progress".to_string(), false);
+            }
+        }
+    }
+
+    pub fn continue_rebase_op(&mut self) {
+        let path = match &self.current_repo_path {
+            Some(p) => p.clone(),
+            None => return,
+        };
+
+        if self.repo_op_state == RepoOpState::Rebasing {
+            match git_actions::rebase_continue(&path) {
+                Ok(msg) => {
+                    self.set_status_message(format!("✓ {}", msg), false);
+                    self.refresh_all_repo_data();
+                }
+                Err(e) => {
+                    self.refresh_all_repo_data();
+                    self.active_modal = Some(ActiveModal::CommandResult {
+                        title: "Rebase Continue Failed".to_string(),
+                        output: e,
+                        is_error: true,
+                        scroll: 0,
+                    });
+                }
+            }
+        }
+    }
+
     pub fn open_help_modal(&mut self) {
         self.active_modal = Some(ActiveModal::Help);
     }
@@ -942,6 +1103,94 @@ impl App {
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
                     *scroll = scroll.saturating_add(1);
+                    ModalEvent::Handled
+                }
+                _ => ModalEvent::Handled,
+            },
+            ActiveModal::MergeRebase {
+                op,
+                current_branch,
+                candidate_branches,
+                selected_branch_idx,
+                strategy,
+                autostash,
+            } => match code {
+                KeyCode::Esc => {
+                    self.active_modal = None;
+                    ModalEvent::Handled
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    if *selected_branch_idx > 0 {
+                        *selected_branch_idx -= 1;
+                    }
+                    ModalEvent::Handled
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if !candidate_branches.is_empty() && *selected_branch_idx + 1 < candidate_branches.len() {
+                        *selected_branch_idx += 1;
+                    }
+                    ModalEvent::Handled
+                }
+                KeyCode::Tab => {
+                    match op {
+                        MergeRebaseOp::Merge => {
+                            *strategy = strategy.next();
+                        }
+                        MergeRebaseOp::Rebase => {
+                            *autostash = !*autostash;
+                        }
+                    }
+                    ModalEvent::Handled
+                }
+                KeyCode::Enter => {
+                    let op_type = *op;
+                    let strat = *strategy;
+                    let do_autostash = *autostash;
+                    let target = candidate_branches.get(*selected_branch_idx).cloned();
+                    let cur_branch = current_branch.clone();
+                    let path = self.current_repo_path.clone();
+                    self.active_modal = None;
+
+                    if let (Some(repo_path), Some(target_branch)) = (path, target) {
+                        match op_type {
+                            MergeRebaseOp::Merge => {
+                                self.set_status_message(format!("Merging '{}' into '{}'...", target_branch, cur_branch), false);
+                                match git_actions::merge(&repo_path, &target_branch, strat) {
+                                    Ok(msg) => {
+                                        self.set_status_message(format!("✓ {}", msg), false);
+                                        self.refresh_all_repo_data();
+                                    }
+                                    Err(err) => {
+                                        self.refresh_all_repo_data();
+                                        self.active_modal = Some(ActiveModal::CommandResult {
+                                            title: format!("Merge '{}' Failed", target_branch),
+                                            output: err,
+                                            is_error: true,
+                                            scroll: 0,
+                                        });
+                                    }
+                                }
+                            }
+                            MergeRebaseOp::Rebase => {
+                                self.set_status_message(format!("Rebasing '{}' onto '{}'...", cur_branch, target_branch), false);
+                                match git_actions::rebase(&repo_path, &target_branch, do_autostash) {
+                                    Ok(msg) => {
+                                        self.set_status_message(format!("✓ {}", msg), false);
+                                        self.refresh_all_repo_data();
+                                    }
+                                    Err(err) => {
+                                        self.refresh_all_repo_data();
+                                        self.active_modal = Some(ActiveModal::CommandResult {
+                                            title: format!("Rebase onto '{}' Failed", target_branch),
+                                            output: err,
+                                            is_error: true,
+                                            scroll: 0,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
                     ModalEvent::Handled
                 }
                 _ => ModalEvent::Handled,
@@ -1256,6 +1505,7 @@ impl App {
                     // Preload status & branches in background
                     let _ = git_actions::load_repo_status(&repo_path).map(|st| self.repo_status = st);
                     let _ = git_actions::load_branches(&repo_path).map(|br| self.branches = br);
+                    self.repo_op_state = git_actions::check_repo_op_state(&repo_path);
 
                     self.sync_table_states();
                     self.active_view = ActiveView::RepoDetail;
@@ -1667,5 +1917,119 @@ mod tests {
 
         app.jump_to_head();
         assert_eq!(app.selected_commit_idx, 0);
+    }
+
+    #[test]
+    fn test_merge_rebase_modal_selection_and_cycle() {
+        let mut app = App::new(PathBuf::from("."), 200, 5);
+        app.active_view = ActiveView::RepoDetail;
+        app.current_tab = RepoTab::Graph;
+        app.current_repo_path = Some(PathBuf::from("."));
+
+        app.branches = vec![
+            BranchItem {
+                name: "feature-branch".into(),
+                is_current: true,
+                is_remote: false,
+                upstream: None,
+                ahead: 0,
+                behind: 0,
+                summary: "feat".into(),
+            },
+            BranchItem {
+                name: "main".into(),
+                is_current: false,
+                is_remote: false,
+                upstream: None,
+                ahead: 0,
+                behind: 0,
+                summary: "main branch".into(),
+            },
+            BranchItem {
+                name: "hotfix".into(),
+                is_current: false,
+                is_remote: false,
+                upstream: None,
+                ahead: 0,
+                behind: 0,
+                summary: "fix".into(),
+            },
+        ];
+
+        // In Graph view, highlighted commit has parsed_ref pointing to "hotfix"
+        app.graph_rows = vec![CommitGraphRow {
+            graph_prefix: "*".into(),
+            hash: "3333333".into(),
+            refs: vec!["hotfix".into()],
+            parsed_refs: vec![crate::model::CommitRef {
+                kind: crate::model::RefKind::LocalBranch("hotfix".into()),
+                display_text: "hotfix".into(),
+                is_paired_upstream: false,
+            }],
+            author: "Dev".into(),
+            relative_time: "2h ago".into(),
+            summary: "quick fix".into(),
+        }];
+        app.selected_commit_idx = 0;
+
+        // Open merge modal: should pre-select "hotfix"
+        app.open_merge_modal();
+        match &app.active_modal {
+            Some(ActiveModal::MergeRebase {
+                op,
+                current_branch,
+                candidate_branches,
+                selected_branch_idx,
+                strategy,
+                ..
+            }) => {
+                assert_eq!(*op, MergeRebaseOp::Merge);
+                assert_eq!(current_branch, "feature-branch");
+                assert_eq!(candidate_branches, &vec!["main".to_string(), "hotfix".to_string()]);
+                assert_eq!(*selected_branch_idx, 1); // "hotfix" index
+                assert_eq!(*strategy, MergeStrategy::Default);
+            }
+            _ => panic!("Expected MergeRebase modal"),
+        }
+
+        // Test Tab cycles strategy
+        let event = app.handle_modal_key(KeyCode::Tab, KeyModifiers::empty());
+        assert!(matches!(event, ModalEvent::Handled));
+        if let Some(ActiveModal::MergeRebase { strategy, .. }) = &app.active_modal {
+            assert_eq!(*strategy, MergeStrategy::NoFastForward);
+        } else {
+            panic!("Expected MergeRebase modal");
+        }
+
+        // Open rebase modal
+        app.active_modal = None;
+        app.open_rebase_modal();
+        match &app.active_modal {
+            Some(ActiveModal::MergeRebase {
+                op,
+                current_branch,
+                selected_branch_idx,
+                autostash,
+                ..
+            }) => {
+                assert_eq!(*op, MergeRebaseOp::Rebase);
+                assert_eq!(current_branch, "feature-branch");
+                assert_eq!(*selected_branch_idx, 1);
+                assert_eq!(*autostash, true);
+            }
+            _ => panic!("Expected MergeRebase modal"),
+        }
+
+        // Test Tab toggles autostash
+        app.handle_modal_key(KeyCode::Tab, KeyModifiers::empty());
+        if let Some(ActiveModal::MergeRebase { autostash, .. }) = &app.active_modal {
+            assert_eq!(*autostash, false);
+        }
+
+        // Test navigation
+        app.handle_modal_key(KeyCode::Up, KeyModifiers::empty());
+        if let Some(ActiveModal::MergeRebase { selected_branch_idx, .. }) = &app.active_modal {
+            assert_eq!(*selected_branch_idx, 0); // "main"
+        }
     }
 }

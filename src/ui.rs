@@ -1,7 +1,7 @@
 use crate::app::App;
 use crate::model::{
-    ActiveModal, ActiveView, CommitRef, ConfirmAction, DiffLineKind, DiffViewerState, RefKind,
-    RepoTab, StatusSection,
+    ActiveModal, ActiveView, CommitRef, ConfirmAction, DiffLineKind, DiffViewerState,
+    MergeRebaseOp, RefKind, RepoOpState, RepoTab, StatusSection,
 };
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
@@ -191,7 +191,7 @@ fn render_repo_detail(f: &mut Frame, app: &mut App, area: Rect) {
         Span::styled("clean", Style::default().fg(Color::Green))
     };
 
-    let header_widget = Paragraph::new(Line::from(vec![
+    let mut header_spans = vec![
         Span::styled(" GIT CLIENT ", Style::default().fg(Color::Black).bg(Color::Green).add_modifier(Modifier::BOLD)),
         Span::raw("  "),
         Span::styled(repo_name, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
@@ -199,8 +199,28 @@ fn render_repo_detail(f: &mut Frame, app: &mut App, area: Rect) {
         Span::styled(current_branch, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
         Span::raw(" │ Status: "),
         status_badge,
-    ]))
-    .block(Block::default().borders(Borders::ALL).title(" Repository Inspector "));
+    ];
+
+    match app.repo_op_state {
+        RepoOpState::Normal => {}
+        RepoOpState::Merging => {
+            header_spans.push(Span::raw(" │ "));
+            header_spans.push(Span::styled(
+                " ⚠ MERGE CONFLICT (Press 'A' to Abort) ",
+                Style::default().fg(Color::White).bg(Color::Red).add_modifier(Modifier::BOLD),
+            ));
+        }
+        RepoOpState::Rebasing => {
+            header_spans.push(Span::raw(" │ "));
+            header_spans.push(Span::styled(
+                " ⚠ REBASING ('A' to Abort, 'C' to Continue) ",
+                Style::default().fg(Color::White).bg(Color::Red).add_modifier(Modifier::BOLD),
+            ));
+        }
+    }
+
+    let header_widget = Paragraph::new(Line::from(header_spans))
+        .block(Block::default().borders(Borders::ALL).title(" Repository Inspector "));
     f.render_widget(header_widget, chunks[0]);
 
     // Tab Bar
@@ -266,20 +286,37 @@ fn render_repo_detail(f: &mut Frame, app: &mut App, area: Rect) {
     }
 
     let footer_text = match app.current_tab {
-        RepoTab::Graph => vec![
-            Span::styled("[Enter] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-            Span::raw("Diff  "),
-            Span::styled("[Tab] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-            Span::raw("Focus  "),
-            Span::styled("[m] ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-            Span::raw("Jump to main  "),
-            Span::styled("[P/p/f] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-            Span::raw("Push/Pull/Fetch  "),
-            Span::styled("[?] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-            Span::raw("Help  "),
-            Span::styled("[Esc/q] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-            Span::raw("Back to Fleet"),
-        ],
+        RepoTab::Graph => {
+            let mut items = vec![
+                Span::styled("[Enter] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::raw("Diff  "),
+                Span::styled("[Tab] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::raw("Focus  "),
+                Span::styled("[m] ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                Span::raw("Main  "),
+                Span::styled("[M] ", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+                Span::raw("Merge  "),
+                Span::styled("[R] ", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+                Span::raw("Rebase  "),
+            ];
+            if app.repo_op_state != RepoOpState::Normal {
+                items.push(Span::styled("[A] ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)));
+                items.push(Span::raw("Abort  "));
+                if app.repo_op_state == RepoOpState::Rebasing {
+                    items.push(Span::styled("[C] ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)));
+                    items.push(Span::raw("Continue  "));
+                }
+            }
+            items.extend(vec![
+                Span::styled("[P/p/f] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::raw("Remotes  "),
+                Span::styled("[?] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::raw("Help  "),
+                Span::styled("[Esc/q] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::raw("Back"),
+            ]);
+            items
+        }
         RepoTab::Status => vec![
             Span::styled("[Space] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
             Span::raw("Stage/Unstage  "),
@@ -296,18 +333,31 @@ fn render_repo_detail(f: &mut Frame, app: &mut App, area: Rect) {
             Span::styled("[?] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
             Span::raw("Help"),
         ],
-        RepoTab::Branches => vec![
-            Span::styled("[Enter/Space] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-            Span::raw("Checkout  "),
-            Span::styled("[n] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-            Span::raw("New Branch  "),
-            Span::styled("[d] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-            Span::raw("Delete Branch  "),
-            Span::styled("[P/p/f] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-            Span::raw("Push/Pull/Fetch  "),
-            Span::styled("[?] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-            Span::raw("Help"),
-        ],
+        RepoTab::Branches => {
+            let mut items = vec![
+                Span::styled("[Enter/Space] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::raw("Checkout  "),
+                Span::styled("[M] ", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+                Span::raw("Merge  "),
+                Span::styled("[R] ", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+                Span::raw("Rebase  "),
+                Span::styled("[n] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::raw("New  "),
+                Span::styled("[d] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::raw("Delete  "),
+            ];
+            if app.repo_op_state != RepoOpState::Normal {
+                items.push(Span::styled("[A] ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)));
+                items.push(Span::raw("Abort  "));
+            }
+            items.extend(vec![
+                Span::styled("[P/p/f] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::raw("Remotes  "),
+                Span::styled("[?] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::raw("Help"),
+            ]);
+            items
+        }
         RepoTab::Stash => vec![
             Span::styled("[s] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
             Span::raw("Save Stash  "),
@@ -1098,6 +1148,134 @@ fn render_active_modal(f: &mut Frame, modal: &ActiveModal, _app: &App, area: Rec
             .alignment(Alignment::Center);
             f.render_widget(footer, chunks[1]);
         }
+        ActiveModal::MergeRebase {
+            op,
+            current_branch,
+            candidate_branches,
+            selected_branch_idx,
+            strategy,
+            autostash,
+        } => {
+            let modal_area = centered_rect(68, 55, area);
+            f.render_widget(Clear, modal_area);
+
+            let (title, border_color, action_desc) = match op {
+                MergeRebaseOp::Merge => (
+                    format!(" Merge into '{}' ", current_branch),
+                    Color::Magenta,
+                    format!("Select branch to merge INTO current branch '{}':", current_branch),
+                ),
+                MergeRebaseOp::Rebase => (
+                    format!(" Rebase '{}' onto branch ", current_branch),
+                    Color::LightMagenta,
+                    format!("Select branch to rebase '{}' ONTO:", current_branch),
+                ),
+            };
+
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .title(title)
+                .title_alignment(Alignment::Center)
+                .border_style(Style::default().fg(border_color).add_modifier(Modifier::BOLD));
+
+            let inner = block.inner(modal_area);
+            f.render_widget(block, modal_area);
+
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(1), // action description prompt
+                    Constraint::Min(4),    // candidate branches list
+                    Constraint::Length(2), // strategy / autostash option
+                    Constraint::Length(1), // controls footer
+                ])
+                .split(inner);
+
+            // 1. Prompt
+            f.render_widget(
+                Paragraph::new(action_desc).style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                chunks[0],
+            );
+
+            // 2. Candidate branches list
+            let visible_rows = chunks[1].height as usize;
+            let scroll_start = if *selected_branch_idx >= visible_rows {
+                *selected_branch_idx + 1 - visible_rows
+            } else {
+                0
+            };
+
+            let branch_lines: Vec<Line> = candidate_branches
+                .iter()
+                .enumerate()
+                .skip(scroll_start)
+                .take(visible_rows)
+                .map(|(idx, b)| {
+                    let is_sel = idx == *selected_branch_idx;
+                    if is_sel {
+                        Line::from(vec![
+                            Span::styled(" ▶ ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                            Span::styled(
+                                format!(" {} ", b),
+                                Style::default()
+                                    .fg(Color::Black)
+                                    .bg(Color::Cyan)
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                        ])
+                    } else {
+                        Line::from(vec![
+                            Span::raw("   "),
+                            Span::styled(b.as_str(), Style::default().fg(Color::White)),
+                        ])
+                    }
+                })
+                .collect();
+
+            let branches_block = Block::default()
+                .borders(Borders::ALL)
+                .title(format!(" Candidate Branches ({}/{}) ", selected_branch_idx + 1, candidate_branches.len()))
+                .border_style(Style::default().fg(Color::DarkGray));
+            f.render_widget(Paragraph::new(branch_lines).block(branches_block), chunks[1]);
+
+            // 3. Strategy / Autostash box
+            let option_span = match op {
+                MergeRebaseOp::Merge => Line::from(vec![
+                    Span::styled("Strategy (<Tab> to cycle): ", Style::default().fg(Color::Yellow)),
+                    Span::styled(
+                        format!("[ {} ]", strategy.label()),
+                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    ),
+                ]),
+                MergeRebaseOp::Rebase => {
+                    let chk = if *autostash { "[X]" } else { "[ ]" };
+                    let style = if *autostash {
+                        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    };
+                    Line::from(vec![
+                        Span::styled("Autostash (<Tab> to toggle): ", Style::default().fg(Color::Yellow)),
+                        Span::styled(format!("{} --autostash (stash before & pop after rebase)", chk), style),
+                    ])
+                }
+            };
+            f.render_widget(Paragraph::new(option_span), chunks[2]);
+
+            // 4. Controls footer
+            let controls = Paragraph::new(Line::from(vec![
+                Span::styled("<Enter> ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::raw("Execute  │  "),
+                Span::styled("<Tab> ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::raw("Toggle Option  │  "),
+                Span::styled("<↑/↓ / k/j> ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::raw("Select Branch  │  "),
+                Span::styled("<Esc> ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::raw("Cancel"),
+            ]))
+            .alignment(Alignment::Center);
+            f.render_widget(controls, chunks[3]);
+        }
         ActiveModal::Help => {
             let modal_area = centered_rect(82, 85, area);
             f.render_widget(Clear, modal_area);
@@ -1127,6 +1305,10 @@ fn render_active_modal(f: &mut Frame, modal: &ActiveModal, _app: &App, area: Rec
                 Line::from("  [ / ]               Cycle through tabs"),
                 Line::from("  m (in Tab 1)        Jump selection immediately to main/master"),
                 Line::from("  H (in Tab 1)        Jump selection to HEAD"),
+                Line::from("  M                   Merge branch into current branch"),
+                Line::from("  R                   Rebase current branch onto branch"),
+                Line::from("  A (if conflict)     Abort in-progress merge or rebase"),
+                Line::from("  C (if rebasing)     Continue in-progress rebase after resolving"),
                 Line::from("  P                   git push (push to tracking upstream)"),
                 Line::from("  p                   git pull (pull from tracking upstream)"),
                 Line::from("  f / F               git fetch --all --prune"),

@@ -12,7 +12,7 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use model::{ActiveModal, ActiveView, RepoTab};
+use model::{ActiveModal, ActiveView, RepoOpState, RepoTab};
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::{
     fs,
@@ -200,6 +200,21 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 // View-specific keybindings
                                 KeyCode::Tab => app.switch_pane(),
                                 KeyCode::Enter => app.on_enter(),
+
+                                // Merge & Rebase (Tab 1 Graph & Tab 3 Branches)
+                                KeyCode::Char('M') if app.current_tab == RepoTab::Graph || app.current_tab == RepoTab::Branches => {
+                                    app.open_merge_modal();
+                                }
+                                KeyCode::Char('R') if app.current_tab == RepoTab::Graph || app.current_tab == RepoTab::Branches => {
+                                    app.open_rebase_modal();
+                                }
+                                // Conflict handling / Abort / Continue
+                                KeyCode::Char('A') if app.repo_op_state != RepoOpState::Normal && app.current_tab != RepoTab::Status => {
+                                    app.abort_current_op();
+                                }
+                                KeyCode::Char('C') if app.repo_op_state == RepoOpState::Rebasing && app.current_tab != RepoTab::Status => {
+                                    app.continue_rebase_op();
+                                }
 
                                 // Tab 1: Graph keys
                                 KeyCode::Char('m') if app.current_tab == RepoTab::Graph => {

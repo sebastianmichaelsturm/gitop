@@ -12,7 +12,7 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use model::{ActiveModal, ActiveView, RepoOpState, RepoTab};
+use model::{ActiveModal, ActiveView, MergeRebaseOp, RepoOpState, RepoTab};
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::{
     fs,
@@ -179,6 +179,25 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                             // Clear any previous transient status message on new user key
                             app.clear_status_message();
 
+                            // Intercept keys if in-graph operation (Merge/Rebase) confirmation bar is active
+                            if app.in_graph_op.is_some() {
+                                match key.code {
+                                    KeyCode::Enter => {
+                                        app.execute_in_graph_op();
+                                        continue;
+                                    }
+                                    KeyCode::Tab => {
+                                        app.toggle_in_graph_op_option();
+                                        continue;
+                                    }
+                                    KeyCode::Esc => {
+                                        app.in_graph_op = None;
+                                        continue;
+                                    }
+                                    _ => {}
+                                }
+                            }
+
                             match key.code {
                                 KeyCode::Esc | KeyCode::Char('q') => app.on_esc(),
                                 KeyCode::Char('?') => app.open_help_modal(),
@@ -203,10 +222,10 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 
                                 // Merge & Rebase (Tab 1 Graph & Tab 3 Branches)
                                 KeyCode::Char('M') if app.current_tab == RepoTab::Graph || app.current_tab == RepoTab::Branches => {
-                                    app.open_merge_modal();
+                                    app.start_in_graph_op(MergeRebaseOp::Merge);
                                 }
                                 KeyCode::Char('R') if app.current_tab == RepoTab::Graph || app.current_tab == RepoTab::Branches => {
-                                    app.open_rebase_modal();
+                                    app.start_in_graph_op(MergeRebaseOp::Rebase);
                                 }
                                 // Conflict handling / Abort / Continue
                                 KeyCode::Char('A') if app.repo_op_state != RepoOpState::Normal && app.current_tab != RepoTab::Status => {

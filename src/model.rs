@@ -327,6 +327,17 @@ pub enum RepoOpState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InGraphOp {
+    pub op: MergeRebaseOp,
+    pub target_ref: String,
+    pub target_display: String,
+    pub commit_hash: String,
+    pub commit_summary: String,
+    pub strategy: MergeStrategy,
+    pub autostash: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActiveModal {
     Commit {
         message: String,
@@ -341,14 +352,6 @@ pub enum ActiveModal {
         title: String,
         prompt: String,
         action: ConfirmAction,
-    },
-    MergeRebase {
-        op: MergeRebaseOp,
-        current_branch: String,
-        candidate_branches: Vec<String>,
-        selected_branch_idx: usize,
-        strategy: MergeStrategy,
-        autostash: bool,
     },
     Help,
     CommandResult {

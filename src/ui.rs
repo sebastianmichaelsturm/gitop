@@ -182,7 +182,7 @@ fn render_repo_detail(f: &mut Frame, app: &mut App, area: Rect) {
         .split(area);
 
     let repo_name = app.current_selected_repo_name().to_string();
-    let current_branch = app.branches.iter().find(|b| b.is_current).map(|b| b.name.as_str()).unwrap_or("HEAD");
+    let current_branch = app.branches.iter().find(|b| b.is_current).map(|b| b.name.clone()).unwrap_or_else(|| "HEAD".to_string());
     let dirty_total = app.repo_status.total_count();
 
     let status_badge = if dirty_total > 0 {
@@ -196,7 +196,7 @@ fn render_repo_detail(f: &mut Frame, app: &mut App, area: Rect) {
         Span::raw("  "),
         Span::styled(repo_name, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
         Span::raw(" │ Branch: "),
-        Span::styled(current_branch, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::styled(&current_branch, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
         Span::raw(" │ Status: "),
         status_badge,
     ];
@@ -265,6 +265,64 @@ fn render_repo_detail(f: &mut Frame, app: &mut App, area: Rect) {
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Length(1)])
         .split(chunks[3]);
+
+    if let Some(op) = &app.in_graph_op {
+        let (banner_bg, banner_fg, op_label, action_text) = match op.op {
+            MergeRebaseOp::Merge => (
+                Color::Magenta,
+                Color::Black,
+                " MERGE ",
+                vec![
+                    Span::raw("Merge '"),
+                    Span::styled(&op.target_display, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                    Span::raw("' into current branch '"),
+                    Span::styled(&current_branch, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                    Span::raw("'"),
+                ],
+            ),
+            MergeRebaseOp::Rebase => (
+                Color::Cyan,
+                Color::Black,
+                " REBASE ",
+                vec![
+                    Span::raw("Rebase current branch '"),
+                    Span::styled(&current_branch, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                    Span::raw("' onto '"),
+                    Span::styled(&op.target_display, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                    Span::raw("'"),
+                ],
+            ),
+        };
+
+        let mut line1_spans = vec![
+            Span::styled(format!(" ▶ {} ", op_label), Style::default().fg(banner_fg).bg(banner_bg).add_modifier(Modifier::BOLD)),
+            Span::raw("  "),
+        ];
+        line1_spans.extend(action_text);
+        if !op.commit_hash.is_empty() && op.commit_hash != op.target_display {
+            line1_spans.push(Span::styled(format!(" ({})", op.commit_hash), Style::default().fg(Color::DarkGray)));
+        }
+
+        let opt_label = match op.op {
+            MergeRebaseOp::Merge => format!("Strategy: {}", op.strategy.label()),
+            MergeRebaseOp::Rebase => format!("Autostash: {}", if op.autostash { "[X] On" } else { "[ ] Off" }),
+        };
+
+        let line2_spans = vec![
+            Span::styled("[Enter] ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled("Execute  │  ", Style::default().fg(Color::White)),
+            Span::styled("[Tab] ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("{}  │  ", opt_label), Style::default().fg(Color::Yellow)),
+            Span::styled("[↑/↓/m] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled("Change target in graph  │  ", Style::default().fg(Color::Gray)),
+            Span::styled("[Esc] ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+            Span::styled("Cancel", Style::default().fg(Color::White)),
+        ];
+
+        f.render_widget(Paragraph::new(Line::from(line1_spans)), footer_chunks[0]);
+        f.render_widget(Paragraph::new(Line::from(line2_spans)), footer_chunks[1]);
+        return;
+    }
 
     if let Some((msg, is_error)) = &app.status_message {
         let style = if *is_error {
@@ -1148,134 +1206,6 @@ fn render_active_modal(f: &mut Frame, modal: &ActiveModal, _app: &App, area: Rec
             .alignment(Alignment::Center);
             f.render_widget(footer, chunks[1]);
         }
-        ActiveModal::MergeRebase {
-            op,
-            current_branch,
-            candidate_branches,
-            selected_branch_idx,
-            strategy,
-            autostash,
-        } => {
-            let modal_area = centered_rect(68, 55, area);
-            f.render_widget(Clear, modal_area);
-
-            let (title, border_color, action_desc) = match op {
-                MergeRebaseOp::Merge => (
-                    format!(" Merge into '{}' ", current_branch),
-                    Color::Magenta,
-                    format!("Select branch to merge INTO current branch '{}':", current_branch),
-                ),
-                MergeRebaseOp::Rebase => (
-                    format!(" Rebase '{}' onto branch ", current_branch),
-                    Color::LightMagenta,
-                    format!("Select branch to rebase '{}' ONTO:", current_branch),
-                ),
-            };
-
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .title(title)
-                .title_alignment(Alignment::Center)
-                .border_style(Style::default().fg(border_color).add_modifier(Modifier::BOLD));
-
-            let inner = block.inner(modal_area);
-            f.render_widget(block, modal_area);
-
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(1), // action description prompt
-                    Constraint::Min(4),    // candidate branches list
-                    Constraint::Length(2), // strategy / autostash option
-                    Constraint::Length(1), // controls footer
-                ])
-                .split(inner);
-
-            // 1. Prompt
-            f.render_widget(
-                Paragraph::new(action_desc).style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-                chunks[0],
-            );
-
-            // 2. Candidate branches list
-            let visible_rows = chunks[1].height as usize;
-            let scroll_start = if *selected_branch_idx >= visible_rows {
-                *selected_branch_idx + 1 - visible_rows
-            } else {
-                0
-            };
-
-            let branch_lines: Vec<Line> = candidate_branches
-                .iter()
-                .enumerate()
-                .skip(scroll_start)
-                .take(visible_rows)
-                .map(|(idx, b)| {
-                    let is_sel = idx == *selected_branch_idx;
-                    if is_sel {
-                        Line::from(vec![
-                            Span::styled(" ▶ ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                            Span::styled(
-                                format!(" {} ", b),
-                                Style::default()
-                                    .fg(Color::Black)
-                                    .bg(Color::Cyan)
-                                    .add_modifier(Modifier::BOLD),
-                            ),
-                        ])
-                    } else {
-                        Line::from(vec![
-                            Span::raw("   "),
-                            Span::styled(b.as_str(), Style::default().fg(Color::White)),
-                        ])
-                    }
-                })
-                .collect();
-
-            let branches_block = Block::default()
-                .borders(Borders::ALL)
-                .title(format!(" Candidate Branches ({}/{}) ", selected_branch_idx + 1, candidate_branches.len()))
-                .border_style(Style::default().fg(Color::DarkGray));
-            f.render_widget(Paragraph::new(branch_lines).block(branches_block), chunks[1]);
-
-            // 3. Strategy / Autostash box
-            let option_span = match op {
-                MergeRebaseOp::Merge => Line::from(vec![
-                    Span::styled("Strategy (<Tab> to cycle): ", Style::default().fg(Color::Yellow)),
-                    Span::styled(
-                        format!("[ {} ]", strategy.label()),
-                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-                    ),
-                ]),
-                MergeRebaseOp::Rebase => {
-                    let chk = if *autostash { "[X]" } else { "[ ]" };
-                    let style = if *autostash {
-                        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(Color::DarkGray)
-                    };
-                    Line::from(vec![
-                        Span::styled("Autostash (<Tab> to toggle): ", Style::default().fg(Color::Yellow)),
-                        Span::styled(format!("{} --autostash (stash before & pop after rebase)", chk), style),
-                    ])
-                }
-            };
-            f.render_widget(Paragraph::new(option_span), chunks[2]);
-
-            // 4. Controls footer
-            let controls = Paragraph::new(Line::from(vec![
-                Span::styled("<Enter> ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                Span::raw("Execute  │  "),
-                Span::styled("<Tab> ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                Span::raw("Toggle Option  │  "),
-                Span::styled("<↑/↓ / k/j> ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                Span::raw("Select Branch  │  "),
-                Span::styled("<Esc> ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                Span::raw("Cancel"),
-            ]))
-            .alignment(Alignment::Center);
-            f.render_widget(controls, chunks[3]);
-        }
         ActiveModal::Help => {
             let modal_area = centered_rect(82, 85, area);
             f.render_widget(Clear, modal_area);
@@ -1305,8 +1235,11 @@ fn render_active_modal(f: &mut Frame, modal: &ActiveModal, _app: &App, area: Rec
                 Line::from("  [ / ]               Cycle through tabs"),
                 Line::from("  m (in Tab 1)        Jump selection immediately to main/master"),
                 Line::from("  H (in Tab 1)        Jump selection to HEAD"),
-                Line::from("  M                   Merge branch into current branch"),
-                Line::from("  R                   Rebase current branch onto branch"),
+                Line::from("  M (in Tab 1 & 3)    Merge highlighted branch/commit into current branch"),
+                Line::from("  R (in Tab 1 & 3)    Rebase current branch onto highlighted branch/commit"),
+                Line::from("  Tab (in action bar) Toggle merge strategy (--no-ff) or autostash"),
+                Line::from("  Enter (in bar)      Confirm and execute merge/rebase"),
+                Line::from("  Esc (in bar)        Cancel action bar"),
                 Line::from("  A (if conflict)     Abort in-progress merge or rebase"),
                 Line::from("  C (if rebasing)     Continue in-progress rebase after resolving"),
                 Line::from("  P                   git push (push to tracking upstream)"),

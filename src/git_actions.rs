@@ -510,16 +510,72 @@ pub fn stash_drop(repo: &Path, index: usize) -> Result<String, String> {
 }
 
 pub fn push(repo: &Path) -> Result<String, String> {
-    let output = Command::new("git")
-        .args(["-C", &repo.to_string_lossy(), "push"])
+    let repo_str = repo.to_string_lossy();
+
+    // 1. Get current branch name
+    let branch_out = Command::new("git")
+        .args(["-C", &repo_str, "rev-parse", "--abbrev-ref", "HEAD"])
         .output()
-        .map_err(|e| format!("Failed to push: {}", e))?;
+        .map_err(|e| format!("Failed to check current branch: {}", e))?;
+
+    let current_branch = String::from_utf8_lossy(&branch_out.stdout).trim().to_string();
+    if current_branch.is_empty() || current_branch == "HEAD" {
+        return Err("Cannot push in detached HEAD state".to_string());
+    }
+
+    // 2. Check if branch already has an upstream tracking branch configured
+    let upstream_out = Command::new("git")
+        .args(["-C", &repo_str, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
+        .output();
+
+    let has_upstream = match upstream_out {
+        Ok(out) => out.status.success(),
+        Err(_) => false,
+    };
+
+    let mut cmd = Command::new("git");
+    cmd.args(["-C", &repo_str, "push"]);
+
+    // If no upstream is configured, automatically push with -u <remote> <current_branch>
+    if !has_upstream {
+        let remotes_out = Command::new("git")
+            .args(["-C", &repo_str, "remote"])
+            .output()
+            .map_err(|e| format!("Failed to list remotes: {}", e))?;
+
+        let remotes_str = String::from_utf8_lossy(&remotes_out.stdout);
+        let remotes: Vec<&str> = remotes_str.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
+
+        if remotes.is_empty() {
+            return Err("No remote repository configured to push to (add a remote with 'git remote add origin <url>')".to_string());
+        }
+
+        let target_remote = if remotes.contains(&"origin") {
+            "origin"
+        } else {
+            remotes[0]
+        };
+
+        cmd.args(["-u", target_remote, &current_branch]);
+    }
+
+    let output = cmd.output().map_err(|e| format!("Failed to push: {}", e))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
 
     if output.status.success() {
-        let out = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        Ok(if out.is_empty() { "Everything up-to-date".to_string() } else { out })
+        let msg = if !stderr.is_empty() {
+            stderr
+        } else if !stdout.is_empty() {
+            stdout
+        } else {
+            "Everything up-to-date".to_string()
+        };
+        Ok(msg)
     } else {
-        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+        let err = if !stderr.is_empty() { stderr } else { stdout };
+        Err(err)
     }
 }
 
@@ -870,5 +926,73 @@ mod tests {
 
         // Clean up
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_push_auto_upstream() {
+        let temp_root = std::env::temp_dir().join(format!("gitop_test_push_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let _ = fs::remove_dir_all(&temp_root);
+        fs::create_dir_all(&temp_root).unwrap();
+
+        let remote_dir = temp_root.join("remote.git");
+        let local_dir = temp_root.join("local");
+
+        // 1. Initialize bare remote repository
+        let _ = Command::new("git").args(["init", "--bare", &remote_dir.to_string_lossy()]).output().unwrap();
+
+        // 2. Initialize local repository
+        fs::create_dir_all(&local_dir).unwrap();
+        let _ = Command::new("git").args(["init", "-b", "main"]).current_dir(&local_dir).output().unwrap();
+        let _ = Command::new("git").args(["config", "user.name", "Test"]).current_dir(&local_dir).output().unwrap();
+        let _ = Command::new("git").args(["config", "user.email", "test@test.com"]).current_dir(&local_dir).output().unwrap();
+
+        // 3. Add remote "origin"
+        let _ = Command::new("git").args(["remote", "add", "origin", &remote_dir.to_string_lossy()]).current_dir(&local_dir).output().unwrap();
+
+        // 4. Create initial commit on main
+        fs::write(local_dir.join("main.txt"), "hello main\n").unwrap();
+        stage_all(&local_dir).unwrap();
+        commit(&local_dir, "initial commit on main", false).unwrap();
+
+        // Verify main has NO upstream initially
+        let up_check = Command::new("git").args(["-C", &local_dir.to_string_lossy(), "rev-parse", "--abbrev-ref", "@{u}"]).output().unwrap();
+        assert!(!up_check.status.success());
+
+        // 5. Push main -> Should automatically run git push -u origin main
+        let push_res = push(&local_dir).unwrap();
+        assert!(!push_res.is_empty());
+
+        // Verify main NOW has upstream origin/main!
+        let up_check_after = Command::new("git").args(["-C", &local_dir.to_string_lossy(), "rev-parse", "--abbrev-ref", "@{u}"]).output().unwrap();
+        assert!(up_check_after.status.success());
+        let up_branch = String::from_utf8_lossy(&up_check_after.stdout).trim().to_string();
+        assert_eq!(up_branch, "origin/main");
+
+        // 6. Create feature branch
+        create_branch(&local_dir, "feat/auto-track", true).unwrap();
+        fs::write(local_dir.join("feat.txt"), "feature data\n").unwrap();
+        stage_all(&local_dir).unwrap();
+        commit(&local_dir, "feature commit", false).unwrap();
+
+        // Verify feat/auto-track has NO upstream
+        let up_feat_check = Command::new("git").args(["-C", &local_dir.to_string_lossy(), "rev-parse", "--abbrev-ref", "@{u}"]).output().unwrap();
+        assert!(!up_feat_check.status.success());
+
+        // 7. Push feat/auto-track -> Should automatically run git push -u origin feat/auto-track
+        let push_feat_res = push(&local_dir).unwrap();
+        assert!(!push_feat_res.is_empty());
+
+        // Verify feat/auto-track NOW has upstream origin/feat/auto-track!
+        let up_feat_after = Command::new("git").args(["-C", &local_dir.to_string_lossy(), "rev-parse", "--abbrev-ref", "@{u}"]).output().unwrap();
+        assert!(up_feat_after.status.success());
+        let up_feat_branch = String::from_utf8_lossy(&up_feat_after.stdout).trim().to_string();
+        assert_eq!(up_feat_branch, "origin/feat/auto-track");
+
+        // 8. Push again when already up to date and has tracking -> normal push succeeds
+        let second_push = push(&local_dir).unwrap();
+        assert!(second_push.contains("Everything up-to-date") || second_push.contains("up to date") || !second_push.is_empty());
+
+        // Clean up
+        let _ = fs::remove_dir_all(&temp_root);
     }
 }

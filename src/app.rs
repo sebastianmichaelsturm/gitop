@@ -690,8 +690,14 @@ impl App {
         self.set_status_message("Pushing changes to remote...".to_string(), false);
         match git_actions::push(&path) {
             Ok(msg) => {
-                self.set_status_message(format!("✓ {}", msg), false);
-                self.refresh_branches();
+                let display_msg = msg
+                    .lines()
+                    .rev()
+                    .find(|l| !l.trim().is_empty())
+                    .unwrap_or(&msg)
+                    .trim();
+                self.set_status_message(format!("✓ {}", display_msg), false);
+                self.refresh_all_repo_data();
             }
             Err(e) => {
                 self.active_modal = Some(ActiveModal::CommandResult {

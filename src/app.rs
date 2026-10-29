@@ -1422,6 +1422,48 @@ impl App {
         }
     }
 
+    pub fn jump_to_main(&mut self) {
+        if self.active_view != ActiveView::RepoDetail || self.current_tab != RepoTab::Graph {
+            return;
+        }
+
+        let main_idx = self.graph_rows.iter().position(|r| {
+            r.parsed_refs.iter().any(|pr| matches!(pr.kind, crate::model::RefKind::Mainline(_)))
+                || r.refs.iter().any(|s| s == "main" || s == "master" || s == "origin/main")
+        });
+
+        if let Some(idx) = main_idx {
+            self.selected_commit_idx = idx;
+            self.on_commit_selection_changed();
+            let hash = &self.graph_rows[idx].hash;
+            let short_hash = if hash.len() > 7 { &hash[..7] } else { hash };
+            self.set_status_message(format!("✓ Jumped to main ({})", short_hash), false);
+        } else {
+            self.set_status_message("No commit labeled 'main' or 'master' found in history".to_string(), true);
+        }
+        self.sync_table_states();
+    }
+
+    pub fn jump_to_head(&mut self) {
+        if self.active_view != ActiveView::RepoDetail || self.current_tab != RepoTab::Graph {
+            return;
+        }
+
+        let head_idx = self.graph_rows.iter().position(|r| {
+            r.parsed_refs.iter().any(|pr| matches!(pr.kind, crate::model::RefKind::Head(_)))
+                || r.refs.iter().any(|s| s.starts_with("HEAD"))
+        }).unwrap_or(0);
+
+        if head_idx < self.graph_rows.len() {
+            self.selected_commit_idx = head_idx;
+            self.on_commit_selection_changed();
+            let hash = &self.graph_rows[head_idx].hash;
+            let short_hash = if hash.len() > 7 { &hash[..7] } else { hash };
+            self.set_status_message(format!("✓ Jumped to HEAD ({})", short_hash), false);
+        }
+        self.sync_table_states();
+    }
+
     fn current_selected_commit_hash(&self) -> String {
         if let Some(row) = self.graph_rows.get(self.selected_commit_idx) {
             if !row.hash.is_empty() {
@@ -1582,5 +1624,48 @@ mod tests {
         } else {
             panic!("Expected commit modal");
         }
+    }
+
+    #[test]
+    fn test_jump_to_main() {
+        let mut app = App::new(PathBuf::from("."), 200, 5);
+        app.active_view = ActiveView::RepoDetail;
+        app.current_tab = RepoTab::Graph;
+
+        app.graph_rows = vec![
+            CommitGraphRow {
+                graph_prefix: "*".into(),
+                hash: "1111111".into(),
+                refs: vec!["HEAD -> feat/test".into()],
+                parsed_refs: vec![crate::model::CommitRef {
+                    kind: crate::model::RefKind::Head("feat/test".into()),
+                    display_text: "HEAD -> feat/test".into(),
+                    is_paired_upstream: false,
+                }],
+                author: "Dev".into(),
+                relative_time: "1m ago".into(),
+                summary: "wip".into(),
+            },
+            CommitGraphRow {
+                graph_prefix: "*".into(),
+                hash: "2222222".into(),
+                refs: vec!["main".into(), "origin/main".into()],
+                parsed_refs: vec![crate::model::CommitRef {
+                    kind: crate::model::RefKind::Mainline("main".into()),
+                    display_text: "main(=)".into(),
+                    is_paired_upstream: true,
+                }],
+                author: "Dev".into(),
+                relative_time: "1d ago".into(),
+                summary: "stable release".into(),
+            },
+        ];
+
+        app.selected_commit_idx = 0;
+        app.jump_to_main();
+        assert_eq!(app.selected_commit_idx, 1);
+
+        app.jump_to_head();
+        assert_eq!(app.selected_commit_idx, 0);
     }
 }

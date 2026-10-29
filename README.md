@@ -122,6 +122,8 @@ gittop
 | <kbd>↓</kbd> / <kbd>j</kbd> | Select next commit / file |
 | <kbd>Tab</kbd> | **Switch pane focus** (Commit Graph ⇄ Changed Files List) |
 | <kbd>Enter</kbd> | **Open Diff Viewer** for selected commit or file |
+| <kbd>m</kbd> | **Jump to `main` / `master`** (instantly jumps selection to main) |
+| <kbd>H</kbd> | **Jump to `HEAD`** (instantly jumps selection to HEAD commit) |
 
 ---
 

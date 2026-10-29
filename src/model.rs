@@ -88,11 +88,28 @@ pub fn format_relative_time(time: DateTime<Utc>) -> String {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefKind {
+    Head(String),
+    Mainline(String),
+    LocalBranch(String),
+    Tag(String),
+    RemoteBranch(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitRef {
+    pub kind: RefKind,
+    pub display_text: String,
+    pub is_paired_upstream: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct CommitGraphRow {
     pub graph_prefix: String,
     pub hash: String,
     pub refs: Vec<String>,
+    pub parsed_refs: Vec<CommitRef>,
     pub author: String,
     pub relative_time: String,
     pub summary: String,
@@ -110,6 +127,7 @@ pub struct CommitDetail {
     pub author: String,
     pub date: String,
     pub full_message: String,
+    pub refs: Vec<CommitRef>,
     pub files: Vec<ChangedFile>,
 }
 

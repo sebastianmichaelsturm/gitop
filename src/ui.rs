@@ -1,12 +1,13 @@
 use crate::app::App;
 use crate::model::{
-    ActiveModal, ActiveView, ConfirmAction, DiffLineKind, DiffViewerState, RepoTab, StatusSection,
+    ActiveModal, ActiveView, CommitRef, ConfirmAction, DiffLineKind, DiffViewerState, RefKind,
+    RepoTab, StatusSection,
 };
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Row, Table, Wrap},
+    widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Wrap},
     Frame,
 };
 
@@ -269,7 +270,9 @@ fn render_repo_detail(f: &mut Frame, app: &mut App, area: Rect) {
             Span::styled("[Enter] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
             Span::raw("Diff  "),
             Span::styled("[Tab] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-            Span::raw("Focus (Graph ⇄ Files)  "),
+            Span::raw("Focus  "),
+            Span::styled("[m] ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::raw("Jump to main  "),
             Span::styled("[P/p/f] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
             Span::raw("Push/Pull/Fetch  "),
             Span::styled("[?] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
@@ -323,6 +326,41 @@ fn render_repo_detail(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_widget(footer_widget, footer_chunks[1]);
 }
 
+pub fn render_ref_badge<'a>(r: &'a CommitRef) -> Span<'a> {
+    match &r.kind {
+        RefKind::Head(_) => Span::styled(
+            format!("[{}]", r.display_text),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        RefKind::Mainline(_) => Span::styled(
+            format!("[{}]", r.display_text),
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
+        RefKind::LocalBranch(_) => Span::styled(
+            format!("[{}]", r.display_text),
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
+        RefKind::Tag(_) => Span::styled(
+            format!("[🏷 {}]", r.display_text),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        RefKind::RemoteBranch(_) => Span::styled(
+            format!("[{}]", r.display_text),
+            Style::default()
+                .fg(Color::Magenta),
+        ),
+    }
+}
+
 // -------------------------------------------------------------------------
 // Tab 1: Log & Commit Graph
 // -------------------------------------------------------------------------
@@ -343,36 +381,34 @@ fn render_tab_graph(f: &mut Frame, app: &mut App, area: Rect) {
             let prefix_span = Span::styled(row.graph_prefix.clone(), Style::default().fg(Color::Cyan));
             let hash_span = Span::styled(row.hash.clone(), Style::default().fg(Color::Yellow));
             
-            let refs_str = if row.refs.is_empty() {
-                String::new()
-            } else {
-                format!("({}) ", row.refs.join(", "))
-            };
-            let refs_span = Span::styled(refs_str, Style::default().fg(Color::Green).add_modifier(Modifier::BOLD));
-            
+            let mut summary_spans = Vec::new();
+            for r in &row.parsed_refs {
+                summary_spans.push(render_ref_badge(r));
+                summary_spans.push(Span::raw(" "));
+            }
+            summary_spans.push(Span::styled(row.summary.clone(), Style::default().fg(Color::White)));
+            let summary_cell = Line::from(summary_spans);
+
             let author_span = Span::styled(row.author.clone(), Style::default().fg(Color::LightBlue));
             let date_span = Span::styled(row.relative_time.clone(), Style::default().fg(Color::DarkGray));
-            let summary_span = Span::styled(row.summary.clone(), Style::default().fg(Color::White));
 
             Row::new(vec![
-                prefix_span,
-                hash_span,
-                refs_span,
-                summary_span,
-                author_span,
-                date_span,
+                Cell::from(prefix_span),
+                Cell::from(hash_span),
+                Cell::from(summary_cell),
+                Cell::from(author_span),
+                Cell::from(date_span),
             ])
         })
         .collect();
 
-    let graph_header = Row::new(vec!["GRAPH", "HASH", "BRANCHES/TAGS", "SUMMARY", "AUTHOR", "DATE"])
+    let graph_header = Row::new(vec!["GRAPH", "HASH", "COMMIT SUMMARY & REFS", "AUTHOR", "DATE"])
         .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
 
     let graph_widths = [
         Constraint::Length(12),
         Constraint::Length(9),
-        Constraint::Length(22),
-        Constraint::Percentage(40),
+        Constraint::Percentage(55),
         Constraint::Length(16),
         Constraint::Length(14),
     ];
@@ -397,7 +433,7 @@ fn render_tab_graph(f: &mut Frame, app: &mut App, area: Rect) {
         .split(chunks[1]);
 
     if let Some(detail) = &app.commit_detail {
-        let info_lines = vec![
+        let mut info_lines = vec![
             Line::from(vec![
                 Span::styled("Commit:  ", Style::default().fg(Color::Yellow)),
                 Span::raw(&detail.hash),
@@ -410,9 +446,21 @@ fn render_tab_graph(f: &mut Frame, app: &mut App, area: Rect) {
                 Span::styled("Date:    ", Style::default().fg(Color::Green)),
                 Span::raw(&detail.date),
             ]),
-            Line::from(""),
-            Line::from(Span::styled(&detail.full_message, Style::default().fg(Color::White))),
         ];
+
+        if !detail.refs.is_empty() {
+            let mut ref_spans = vec![
+                Span::styled("Refs:    ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            ];
+            for r in &detail.refs {
+                ref_spans.push(render_ref_badge(r));
+                ref_spans.push(Span::raw(" "));
+            }
+            info_lines.push(Line::from(ref_spans));
+        }
+
+        info_lines.push(Line::from(""));
+        info_lines.push(Line::from(Span::styled(&detail.full_message, Style::default().fg(Color::White))));
 
         let info_widget = Paragraph::new(info_lines)
             .block(Block::default().borders(Borders::ALL).title(" Commit Message "))
@@ -1077,9 +1125,11 @@ fn render_active_modal(f: &mut Frame, modal: &ActiveModal, _app: &App, area: Rec
                 Line::from("  3                   Switch to Tab 3: Branches"),
                 Line::from("  4                   Switch to Tab 4: Stashes"),
                 Line::from("  [ / ]               Cycle through tabs"),
+                Line::from("  m (in Tab 1)        Jump selection immediately to main/master"),
+                Line::from("  H (in Tab 1)        Jump selection to HEAD"),
                 Line::from("  P                   git push (push to tracking upstream)"),
                 Line::from("  p                   git pull (pull from tracking upstream)"),
-                Line::from("  f                   git fetch --all --prune"),
+                Line::from("  f / F               git fetch --all --prune"),
                 Line::from("  ?                   Toggle this help screen"),
                 Line::from("  Esc / q             Return to Fleet Overview"),
                 Line::from(""),

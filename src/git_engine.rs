@@ -1,4 +1,7 @@
-use crate::model::{ChangedFile, CommitDetail, CommitGraphRow, DiffLine, DiffLineKind, RepoRecord};
+use crate::model::{
+    ChangedFile, CommitDetail, CommitGraphRow, CommitRef, DiffLine, DiffLineKind, RefKind,
+    RepoRecord,
+};
 use chrono::DateTime;
 use git2::{BranchType, Repository, StatusOptions};
 use rayon::prelude::*;
@@ -309,6 +312,144 @@ pub fn sort_repo_records(records: &mut [RepoRecord]) {
     });
 }
 
+/// Parses and intelligently prioritizes git ref decorations (%d)
+pub fn parse_commit_refs(refs_raw: &str) -> Vec<CommitRef> {
+    if refs_raw.trim().is_empty() {
+        return Vec::new();
+    }
+
+    let trimmed = refs_raw
+        .trim()
+        .trim_start_matches('(')
+        .trim_end_matches(')')
+        .trim();
+
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+
+    let raw_tokens: Vec<&str> = trimmed
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let mut remotes: Vec<String> = Vec::new();
+    let mut non_remotes: Vec<&str> = Vec::new();
+
+    for token in raw_tokens {
+        // Skip noisy symbolic ref origin/HEAD
+        if token == "origin/HEAD" || (token.ends_with("/HEAD") && !token.starts_with("HEAD")) {
+            continue;
+        }
+
+        if (token.starts_with("origin/") || token.starts_with("upstream/") || token.starts_with("remotes/"))
+            && !token.starts_with("HEAD")
+        {
+            remotes.push(token.to_string());
+        } else {
+            non_remotes.push(token);
+        }
+    }
+
+    let mut result: Vec<CommitRef> = Vec::new();
+    let mut consumed_remotes: Vec<String> = Vec::new();
+
+    for token in non_remotes {
+        if let Some(target) = token.strip_prefix("HEAD -> ") {
+            let target_name = target.trim();
+            let matching_remote = format!("origin/{}", target_name);
+            let is_paired = remotes.contains(&matching_remote);
+            if is_paired {
+                consumed_remotes.push(matching_remote);
+            }
+
+            result.push(CommitRef {
+                kind: RefKind::Head(target_name.to_string()),
+                display_text: if is_paired {
+                    format!("HEAD -> {}(=)", target_name)
+                } else {
+                    format!("HEAD -> {}", target_name)
+                },
+                is_paired_upstream: is_paired,
+            });
+        } else if token == "HEAD" {
+            result.push(CommitRef {
+                kind: RefKind::Head("HEAD".to_string()),
+                display_text: "HEAD".to_string(),
+                is_paired_upstream: false,
+            });
+        } else if let Some(tag_name) = token.strip_prefix("tag: ") {
+            result.push(CommitRef {
+                kind: RefKind::Tag(tag_name.trim().to_string()),
+                display_text: tag_name.trim().to_string(),
+                is_paired_upstream: false,
+            });
+        } else if token == "main" || token == "master" || token == "develop" || token == "trunk" {
+            let matching_remote = format!("origin/{}", token);
+            let is_paired = remotes.contains(&matching_remote);
+            if is_paired {
+                consumed_remotes.push(matching_remote);
+            }
+
+            result.push(CommitRef {
+                kind: RefKind::Mainline(token.to_string()),
+                display_text: if is_paired {
+                    format!("{}(=)", token)
+                } else {
+                    token.to_string()
+                },
+                is_paired_upstream: is_paired,
+            });
+        } else {
+            let matching_remote = format!("origin/{}", token);
+            let is_paired = remotes.contains(&matching_remote);
+            if is_paired {
+                consumed_remotes.push(matching_remote);
+            }
+
+            result.push(CommitRef {
+                kind: RefKind::LocalBranch(token.to_string()),
+                display_text: if is_paired {
+                    format!("{}(=)", token)
+                } else {
+                    token.to_string()
+                },
+                is_paired_upstream: is_paired,
+            });
+        }
+    }
+
+    for r in remotes {
+        if !consumed_remotes.contains(&r) {
+            result.push(CommitRef {
+                kind: RefKind::RemoteBranch(r.clone()),
+                display_text: r,
+                is_paired_upstream: false,
+            });
+        }
+    }
+
+    result.sort_by(|a, b| {
+        let rank = |k: &RefKind| match k {
+            RefKind::Head(_) => 0,
+            RefKind::Mainline(_) => 1,
+            RefKind::LocalBranch(_) => 2,
+            RefKind::Tag(_) => 3,
+            RefKind::RemoteBranch(_) => 4,
+        };
+        let r_a = rank(&a.kind);
+        let r_b = rank(&b.kind);
+        if r_a != r_b {
+            r_a.cmp(&r_b)
+        } else {
+            a.display_text.cmp(&b.display_text)
+        }
+    });
+
+    result
+}
+
 /// Loads git log with full branch graph via `git log --graph --all`
 pub fn load_commit_graph(
     repo_path: &Path,
@@ -359,10 +500,13 @@ pub fn load_commit_graph(
                 Vec::new()
             };
 
+            let parsed_refs = parse_commit_refs(refs_raw);
+
             rows.push(CommitGraphRow {
                 graph_prefix,
                 hash,
                 refs,
+                parsed_refs,
                 author,
                 relative_time,
                 summary,
@@ -373,6 +517,7 @@ pub fn load_commit_graph(
                 graph_prefix: line.to_string(),
                 hash: String::new(),
                 refs: Vec::new(),
+                parsed_refs: Vec::new(),
                 author: String::new(),
                 relative_time: String::new(),
                 summary: String::new(),
@@ -395,7 +540,7 @@ pub fn load_commit_details(
             "show",
             "--name-status",
             "--color=never",
-            "--format=format:INFO%x09%H%x09%an <%ae>%x09%ad%x09%B---SPLIT_FILES---",
+            "--format=format:INFO%x09%H%x09%an <%ae>%x09%ad%x09%d%x09%B---SPLIT_FILES---",
             commit_hash,
         ])
         .output()?;
@@ -404,6 +549,7 @@ pub fn load_commit_details(
     let mut hash = commit_hash.to_string();
     let mut author = String::new();
     let mut date = String::new();
+    let mut refs = Vec::new();
     let mut full_message = String::new();
     let mut files = Vec::new();
 
@@ -412,7 +558,7 @@ pub fn load_commit_details(
         let files_part = &stdout[split_pos + "---SPLIT_FILES---".len()..];
 
         if let Some(info_payload) = header_part.strip_prefix("INFO\t") {
-            let mut parts = info_payload.splitn(4, '\t');
+            let mut parts = info_payload.splitn(5, '\t');
             if let Some(h) = parts.next() {
                 hash = h.to_string();
             }
@@ -421,6 +567,9 @@ pub fn load_commit_details(
             }
             if let Some(d) = parts.next() {
                 date = d.to_string();
+            }
+            if let Some(r) = parts.next() {
+                refs = parse_commit_refs(r);
             }
             if let Some(m) = parts.next() {
                 full_message = m.trim().to_string();
@@ -448,6 +597,7 @@ pub fn load_commit_details(
         author,
         date,
         full_message,
+        refs,
         files,
     })
 }
@@ -707,5 +857,38 @@ mod tests {
         assert_eq!(records[0].name, "newest");
         assert_eq!(records[1].name, "old");
         assert_eq!(records[2].name, "none");
+    }
+
+    #[test]
+    fn test_parse_commit_refs_prioritization_and_pairing() {
+        // Raw string where main is hidden at the end after tags and remotes
+        let raw = " (tag: v0.1.0, origin/main, origin/HEAD, main, feat/cargo-metadata)";
+        let refs = parse_commit_refs(raw);
+
+        // Expect 3 refs:
+        // 1. main (paired with origin/main -> main(=))
+        // 2. feat/cargo-metadata
+        // 3. tag v0.1.0
+        // (origin/HEAD should be pruned)
+        assert_eq!(refs.len(), 3);
+
+        // main must be FIRST!
+        assert_eq!(refs[0].display_text, "main(=)");
+        assert!(matches!(refs[0].kind, RefKind::Mainline(_)));
+        assert!(refs[0].is_paired_upstream);
+
+        assert_eq!(refs[1].display_text, "feat/cargo-metadata");
+        assert!(matches!(refs[1].kind, RefKind::LocalBranch(_)));
+
+        assert_eq!(refs[2].display_text, "v0.1.0");
+        assert!(matches!(refs[2].kind, RefKind::Tag(_)));
+
+        // Test HEAD priority
+        let raw_head = " (HEAD -> feat/test, main, origin/main)";
+        let head_refs = parse_commit_refs(raw_head);
+        assert_eq!(head_refs.len(), 2);
+        assert_eq!(head_refs[0].display_text, "HEAD -> feat/test");
+        assert!(matches!(head_refs[0].kind, RefKind::Head(_)));
+        assert_eq!(head_refs[1].display_text, "main(=)");
     }
 }

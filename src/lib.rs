@@ -201,6 +201,14 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 KeyCode::Tab => app.switch_pane(),
                                 KeyCode::Enter => app.on_enter(),
 
+                                // Tab 1: Graph keys
+                                KeyCode::Char('m') if app.current_tab == RepoTab::Graph => {
+                                    app.jump_to_main();
+                                }
+                                KeyCode::Char('H') if app.current_tab == RepoTab::Graph => {
+                                    app.jump_to_head();
+                                }
+
                                 // Tab 2: Status & Staging keys
                                 KeyCode::Char(' ') if app.current_tab == RepoTab::Status => {
                                     app.toggle_stage_selected();
